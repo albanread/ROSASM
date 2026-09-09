@@ -3,6 +3,8 @@ name = "rosasm"
 version = "0.1.0"
 edition = "2021"
 description = "ObjAsm-compatible assembler front end for RISC OS 5; encodes via LLVM"
+license = "MIT"
+authors = ["Alban Read"]
 
 [dependencies]
 

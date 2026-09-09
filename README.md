@@ -7,6 +7,11 @@ ObjAsm is Acorn's macro assembler. It is also 52% of RISC OS 5 by line count —
 RISC OS. So a RISC OS build on a development machine needs an assembler that
 speaks ObjAsm's language, and there isn't one. This is that assembler.
 
+It is new work, not a port. Nothing here derives from Acorn's assembler: the
+language is implemented from the published ObjAsm manual and measured against
+the RISC OS 5 sources, and the real ObjAsm appears only as a differential
+oracle — something to disagree with — running under an emulator in `tools/`.
+
 The division of labour is deliberate:
 
 ```
@@ -110,6 +115,4 @@ sources that need headers only the build's `export_hdrs` step produces.
 
 ## Licence
 
-Not yet declared. The surrounding tree licenses its own work under Apache-2.0
-(see `LICENSING.md` there), which is the intended choice here too — but this
-repository carries no `LICENSE` file yet.
+MIT. Copyright (c) 2026 Alban Read. See `LICENSE`.

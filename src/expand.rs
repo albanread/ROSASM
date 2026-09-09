@@ -1283,8 +1283,7 @@ impl<'a> Expander<'a> {
         !matches!(
             up,
             "[" | "IF" | "|" | "ELSE" | "ELIF" | "]" | "ENDIF" | "GET" | "INCLUDE" | "LNK"
-                | "MACRO"
-                | "ELIF" | "WHILE" | "WEND" | "MEXIT" | "MEND" | "GBLA" | "GBLL" | "GBLS"
+                | "MACRO" | "WHILE" | "WEND" | "MEXIT" | "MEND" | "GBLA" | "GBLL" | "GBLS"
                 | "LCLA" | "LCLL" | "LCLS" | "SETA" | "SETL" | "SETS" | "END"
                 | "*" | "EQU" | "^" | "MAP" | "#" | "FIELD" | "ROUT" | "AREA"
                 | "RN" | "CN" | "FN" | "DN" | "SN" | "ASSERT" | "OPT" | "TTL" | "SUBT"
