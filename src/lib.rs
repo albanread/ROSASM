@@ -13,6 +13,7 @@
 pub mod aof;
 pub mod elfread;
 pub mod expand;
+pub mod fpa;
 pub mod expr;
 pub mod layout;
 pub mod legalize;

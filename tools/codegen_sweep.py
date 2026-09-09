@@ -47,9 +47,10 @@ def classify(err):
     return first.strip()[:80] or "failed with no message"
 
 
-# Warnings the driver prints per instruction, which do not stop the object
-# being written but say what would not execute.
-UNSUPPORTED = re.compile(r"rosasm: [^\n]*?:\d+: (\S+) (writes the PSR|is deprecated)")
+# Warnings the driver prints per instruction. These do not stop the object
+# being written -- the instruction becomes a zero word and the addresses
+# around it stay put -- but they say what would not execute.
+UNSUPPORTED = re.compile(r"rosasm: [^\n]*?:\d+: ([A-Z][A-Z0-9.]*)[: ]")
 UNHANDLED_RELOC = re.compile(r"unhandled relocation type (\d+)")
 
 
@@ -121,7 +122,10 @@ def main():
     unsupported = collections.Counter(m for r in results for m in r.get("unsupported", []))
     if unsupported:
         lines.append("")
-        lines.append("instructions with no 32-bit form (emitted as a zero word):")
+        lines.append(
+            f"instructions with no equivalent on this target "
+            f"({sum(unsupported.values())} in all, each a zero word):"
+        )
         for m, n in unsupported.most_common(20):
             lines.append(f"  {n:5d}  {m}")
 

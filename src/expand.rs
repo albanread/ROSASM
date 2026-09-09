@@ -327,6 +327,9 @@ pub struct Expander<'a> {
     reg_aliases: std::collections::HashMap<String, u32>,
     /// VFP register names declared with `DN` (double) and `SN` (single).
     vfp_aliases: std::collections::HashMap<String, (char, u32)>,
+    /// FPA register names declared with `FN`. `FACC FN 0` is `f0`, and the
+    /// maths sources name their working registers this way throughout.
+    fpa_aliases: std::collections::HashMap<String, u32>,
     /// Local label definitions: (ROUT scope, number, address).
     locals: Vec<LocalDef>,
     /// The assembly-time variables as the caller left them: the `-PD`
@@ -513,6 +516,7 @@ impl<'a> Expander<'a> {
             data_fixups: Vec::new(),
             reg_aliases: std::collections::HashMap::new(),
             vfp_aliases: std::collections::HashMap::new(),
+            fpa_aliases: std::collections::HashMap::new(),
             locals: Vec::new(),
             locals_prev: Vec::new(),
             initial_vars: std::collections::HashMap::new(),
@@ -967,6 +971,11 @@ impl<'a> Expander<'a> {
                         }
                     } else if let Some((kind, n)) = self.vfp_aliases.get(&word) {
                         out.push_str(&format!("{kind}{n}"));
+                    } else if let Some(n) = self.fpa_aliases.get(&word) {
+                        // Reduced to the architectural spelling; which VFP
+                        // register it becomes depends on the instruction's
+                        // precision, which only the FPA translation knows.
+                        out.push_str(&format!("f{n}"));
                     } else {
                         out.push_str(&word);
                     }
@@ -1559,8 +1568,11 @@ impl<'a> Expander<'a> {
                     "SN" => {
                         self.vfp_aliases.insert(name, ('s', n));
                     }
-                    // A coprocessor or FPA register number is not an ARM
-                    // register and must not be substituted as one.
+                    "FN" => {
+                        self.fpa_aliases.insert(name, n);
+                    }
+                    // A coprocessor register number is not an ARM register
+                    // and must not be substituted as one.
                     _ => {}
                 }
                 Ok(())
@@ -1602,6 +1614,8 @@ impl<'a> Expander<'a> {
             self.syms.define_absolute(&format!("F{i}"), i);
             self.syms.define_absolute(&format!("f{i}"), i);
             self.syms.define_absolute(&format!("acc{i}"), i);
+            self.fpa_aliases.insert(format!("F{i}"), i);
+            self.fpa_aliases.insert(format!("f{i}"), i);
         }
         for i in 0..16u32 {
             self.syms.define_absolute(&format!("C{i}"), i);
@@ -1712,6 +1726,10 @@ impl<'a> Expander<'a> {
             _ => {}
         }
 
+        // Worked out before the area is borrowed, because the match below
+        // holds it mutably.
+        let fpa_words = crate::fpa::words(&up);
+
         let Some(area) = self.area.as_mut() else { return };
         if let Some(n) = layout::data_size(&up, operands) {
             area.offset = area.offset.wrapping_add(n);
@@ -1743,6 +1761,12 @@ impl<'a> Expander<'a> {
             // `ADRL` is a pseudo-instruction that always occupies two
             // instructions, whether or not the offset would fit in one.
             _ if crate::lower::is_adrl(&up) => area.offset = area.offset.wrapping_add(8),
+            // An FPA instruction is one word on an FPA. On this target it
+            // becomes VFP, and a compare becomes two instructions -- so the
+            // location counter has to ask rather than assume.
+            _ if fpa_words.is_some() => {
+                area.offset = area.offset.wrapping_add(4 * fpa_words.unwrap_or(1))
+            }
             // Anything else that reaches here is an ARM instruction.
             _ => area.offset = area.offset.wrapping_add(4),
         }

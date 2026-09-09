@@ -35,3 +35,7 @@ path = "src/bin/rosasm.rs"
 [[bin]]
 name = "aofdump"
 path = "src/bin/aofdump.rs"
+
+[[bin]]
+name = "fpacheck"
+path = "src/bin/fpacheck.rs"

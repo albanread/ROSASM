@@ -206,6 +206,23 @@ pub fn legalize(mnemonic: &str, operands: &str, ctx: &Context) -> Legalized {
         }
     }
 
+    // The FPA instruction set, which this target does not have. What VFP can
+    // express is translated; what it cannot is refused by name, with the
+    // reason, rather than turned into something that would quietly compute a
+    // different answer.
+    if let Some(l) = crate::fpa::convert(&up, operands) {
+        return l;
+    }
+
+    // ObjAsm lets a single-register `VPUSH`/`VPOP` go without its braces, and
+    // `Trig64` writes it both ways in one file. UAL always wants them.
+    if up.starts_with("VPUSH") || up.starts_with("VPOP") {
+        let o = operands.trim();
+        if !o.starts_with('{') {
+            return Legalized::One(up, format!("{{{o}}}"));
+        }
+    }
+
     if lower::is_psr_form(&up) {
         return Legalized::Unsupported(format!(
             "{up} writes the PSR in 26-bit mode and has no 32-bit form"
@@ -392,6 +409,34 @@ mod tests {
                 other => panic!("{m} should be unsupported, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn an_fpa_instruction_is_translated_here() {
+        let ctx = Context { here: 0, target: None };
+        assert_eq!(
+            legalize("ADFD", "f0, f1, f2", &ctx),
+            Legalized::One("VADD.F64".into(), "d0, d1, d2".into())
+        );
+        // And one VFP has no answer for is refused, not mistranslated.
+        assert!(matches!(
+            legalize("LDFE", "f0, [sp], #12", &ctx),
+            Legalized::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn a_braceless_register_list_gets_its_braces() {
+        let ctx = Context { here: 0, target: None };
+        assert_eq!(
+            legalize("VPUSH", "d8", &ctx),
+            Legalized::One("VPUSH".into(), "{d8}".into())
+        );
+        // One that already has them is left alone.
+        assert_eq!(
+            legalize("VPOP", "{ d8-d9 }", &ctx),
+            Legalized::One("VPOP".into(), "{ d8-d9 }".into())
+        );
     }
 
     #[test]
