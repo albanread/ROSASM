@@ -1,0 +1,10 @@
+# Build output.
+/target
+
+# Harness output: emulator runs and corpus sweeps, all regenerable.
+/tools/runs/
+__pycache__/
+*.pyc
+
+# Per-instance farm summaries, written by tools/farm.py.
+/tools/.farm-*.txt
