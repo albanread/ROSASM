@@ -126,7 +126,7 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>) {
         };
         // Everything ObjAsm understands and LLVM does not is resolved here:
         // expressions, register aliases and bar-quoted names.
-        let operands = ex.encoder_operands(l, &raw);
+        let operands = ex.encoder_operands(l, op, &raw);
         let operands = rosasm::lower::translate_numbers(&operands);
         // One label per line lets the encoded bytes be matched back to the
         // line that produced them, whatever the instruction expands to.

@@ -64,15 +64,32 @@ ROSASM = r"F:\RISCOSDEV\rosasm\target\release\rosasm.exe"
 AOFDUMP = r"F:\RISCOSDEV\rosasm\target\release\aofdump.exe"
 
 
-def rm(path):
-    """Remove a tree, never following a link out of it."""
+def rm(path, patience=20.0):
+    """Remove a tree, never following a link out of it.
+
+    Patient, because the emulator has only just written the object file and
+    HostFS may still hold it open: Windows refuses to unlink a file another
+    process has, and giving up on that would throw away the whole run.
+    """
+    deadline = time.time() + patience
+    while True:
+        try:
+            _rm(path)
+            return
+        except OSError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.25)
+
+
+def _rm(path):
     if not os.path.isdir(path):
         return
     for entry in os.scandir(path):
         if entry.is_junction() or entry.is_symlink():
             (os.rmdir if entry.is_dir(follow_symlinks=False) else os.unlink)(entry.path)
         elif entry.is_dir(follow_symlinks=False):
-            rm(entry.path)
+            _rm(entry.path)
         else:
             os.unlink(entry.path)
     os.rmdir(path)
@@ -103,6 +120,15 @@ def stage_unit(unit, generated):
         src = os.path.join(comp, name)
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(STAGE, name), dirs_exist_ok=True)
+    # And the loose files at the component's root. `VersionASM` is one, and
+    # ninety other components have one: `GET VersionASM` names it with no
+    # directory, so it has to sit where `-i` points. Assembling here finds it
+    # because the component's own directory is on the include path; ObjAsm has
+    # only what is staged.
+    for name in os.listdir(comp):
+        src = os.path.join(comp, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(STAGE, name))
     # A generated source -- `s.TokHelpSrc` and the like -- sits alongside.
     for i, arg in enumerate(generated):
         if arg == "-I" and i + 1 < len(generated):
@@ -132,7 +158,7 @@ def via_file(predefines):
     return STAGE_NAME + ".via"
 
 
-def objasm(sh, unit, predefines, extra_i, variables):
+def objasm(sh, unit, predefines, extra_i, variables, hdrdirs):
     """Assemble on the emulator, returning the host path of the object.
 
     The build's variables are set twice over, and they are not the same thing
@@ -148,10 +174,12 @@ def objasm(sh, unit, predefines, extra_i, variables):
     for k, v in sorted(variables.items()):
         sh.cmd(f"Set {k} {v}")
     root = "HostFS::HostFS.$"
-    sh.cmd(
-        f"Set Hdr$Path {root}.{STAGE_NAME}.hdr.,{root}.{HDR_NAME}.Global."
-        f",{root}.{HDR_NAME}.Interface."
-    )
+    # The same path the build sets, in the same order: the component's own
+    # headers first, then each exported tree. Naming them from `hdrdirs`
+    # rather than listing them keeps `Interface2` -- which the build has and
+    # which was missing here -- from being dropped again.
+    exported = "".join(f",{root}.{HDR_NAME}.{os.path.basename(d)}." for d in hdrdirs)
+    sh.cmd(f"Set Hdr$Path {root}.{STAGE_NAME}.hdr.{exported}")
     via = via_file(predefines)
     cmd = (
         f"Run {OBJASM} -via {via} -o {STAGE_NAME}.o.{name}"
@@ -214,16 +242,20 @@ def compare_one(setup, sh, unit, limit, keep):
     """
     predefines, generated = setup.inputs_for(unit)
     comp = stage_unit(unit, generated)
-    theirs, log = objasm(sh, unit, predefines, "", setup.variables)
+    theirs, log = objasm(sh, unit, predefines, "", setup.variables, setup.hdrdirs)
     mine = os.path.join(os.environ.get("TEMP", "."), "rosasm-ours.o")
     if os.path.isfile(mine):
         os.unlink(mine)
     r = ours(unit, comp, setup.hdrdirs, predefines, generated, mine)
 
     if theirs is None:
-        return "objasm-failed", "\n".join(log.strip().splitlines()[-4:])
+        # ObjAsm prints the offending listing line before its error, so
+        # the tail of the log is what says why.
+        return "objasm-failed", "\n".join(
+            x for x in log.strip().splitlines()[-14:] if x.strip()
+        )
     if r.returncode != 0 or not os.path.isfile(mine):
-        return "ours-failed", "\n".join(r.stderr.strip().splitlines()[-4:])
+        return "ours-failed", "\n".join(r.stderr.strip().splitlines()[-8:])
     d = subprocess.run(
         [AOFDUMP, mine, "--against", theirs, "-n", str(limit)],
         capture_output=True,
@@ -268,6 +300,12 @@ def many(root, build, limit, count, out):
         label = os.path.relpath(unit, os.path.join(root, "Sources"))
         try:
             verdict, detail = compare_one(setup, sh, unit, limit, False)
+        except OSError as e:
+            # Staging, not the emulator: keep the instance and lose one unit.
+            tally["staging-failed"] = tally.get("staging-failed", 0) + 1
+            rows.append(("staging-failed", label, str(e)))
+            print(f"[staging failed for {label}: {e}]", file=sys.stderr)
+            continue
         except Exception as e:
             # A dead instance loses every unit after it unless it is restarted.
             print(f"[restart after {label}: {e}]", file=sys.stderr)
@@ -287,7 +325,8 @@ def many(root, build, limit, count, out):
     except Exception:
         pass
 
-    order = ["same", "differ", "ours-failed", "objasm-failed", "emulator-died"]
+    order = ["same", "differ", "ours-failed", "objasm-failed",
+             "staging-failed", "emulator-died"]
     print()
     print(f"units compared   {len(rows)}")
     for k in order:
@@ -302,7 +341,7 @@ def many(root, build, limit, count, out):
         with open(out, "w", encoding="utf-8") as f:
             for verdict, label, detail in rows:
                 f.write(f"{verdict:14} {label}\n")
-                if verdict in ("differ", "ours-failed"):
+                if verdict != "same":
                     for line in detail.splitlines():
                         f.write(f"    {line}\n")
         print(f"written to {out}")

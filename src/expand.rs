@@ -1122,6 +1122,41 @@ impl<'a> Expander<'a> {
         }
     }
 
+    /// Rewrite `LDR Rd, sym` as `LDR Rd, [Rbase, #offset]` when `sym` came
+    /// from a register-relative storage map.
+    ///
+    /// The manual: a label defined under `MAP expr,Rn` is an offset from that
+    /// register, not an address, and naming one where an address goes is how
+    /// the sources reach their workspace -- `STR r0, NextPump` for a field of
+    /// the block `wp` points at. Left alone the name reads as an external
+    /// symbol and the load becomes program-relative, which is not the same
+    /// instruction and not the same answer.
+    ///
+    /// An expression may mix in ordinary absolute symbols, as
+    /// `scratchbuffer1 + ms_action` does; what it may not do is name two
+    /// symbols based on different registers, which has no meaning.
+    fn fold_based_address(&self, group: &str, line: &ExpandedLine) -> Option<String> {
+        let t = group.trim();
+        if t.is_empty() || t.starts_with(['#', '[', '{', '=', '"', '\'']) {
+            return None;
+        }
+        let names = identifiers(t);
+        let bases: Vec<u32> = names
+            .iter()
+            .filter_map(|n| self.field_bases.get(n).copied())
+            .collect();
+        let base = *bases.first()?;
+        if !bases.iter().all(|b| *b == base) {
+            return None;
+        }
+        let text = self.substitute_locals(t, line.addr, line.area_index, line.rout.as_deref());
+        let text = Self::substitute_dot(&text, line.addr);
+        match expr::eval(&text, &self.syms) {
+            Ok(Value::Arith(v)) => Some(format!("[r{base}, #{}]", v as i32)),
+            _ => None,
+        }
+    }
+
     /// Rewrite an instruction's operands into something the encoder can parse.
     ///
     /// This is where the division of labour is enforced: ObjAsm's expression
@@ -1136,11 +1171,18 @@ impl<'a> Expander<'a> {
     ///
     /// An expression that will not evaluate is left alone, so the encoder's
     /// complaint names the symbol that is actually missing.
-    pub fn encoder_operands(&self, line: &ExpandedLine, operands: &str) -> String {
+    pub fn encoder_operands(&self, line: &ExpandedLine, op: &str, operands: &str) -> String {
+        // `ADR` also takes a register-relative symbol, but as arithmetic on
+        // the base rather than a load from it, so it keeps the bare name and
+        // the driver decides. Everything else naming one wants the memory.
+        let addressing = !crate::lower::is_adr(op) && !crate::lower::is_adrl(op);
         // The address an instruction refers to is always its last operand, and
         // is folded whole before anything else looks at the text.
         let groups = layout::split_top_level(operands);
-        let operands = match groups.last().and_then(|g| self.fold_address(g, line)) {
+        let operands = match groups.last().and_then(|g| {
+            self.fold_address(g, line)
+                .or_else(|| addressing.then(|| self.fold_based_address(g, line)).flatten())
+        }) {
             Some(folded) => {
                 let mut v: Vec<String> = groups[..groups.len() - 1].to_vec();
                 v.push(folded);
@@ -1892,15 +1934,22 @@ impl<'a> Expander<'a> {
         self.map_counter = v;
         // `MAP expr,Rn` makes every symbol a following FIELD defines relative
         // to Rn, until the next MAP says otherwise.
-        self.map_base = parts.get(1).and_then(|r| {
-            r.trim()
-                .trim_start_matches(['R', 'r'])
-                .parse::<u32>()
-                .ok()
-                .filter(|n| *n < 16)
-        });
+        self.map_base = parts.get(1).and_then(|r| self.register_number(r.trim()));
         self.set_builtin_at();
         Ok(())
+    }
+
+    /// The register a name stands for, whether written `r12`, `R12` or under
+    /// an `RN` alias. Storage maps are nearly always based on an alias --
+    /// `^ 0, wp` -- so reading only the numbered spelling loses them all.
+    fn register_number(&self, word: &str) -> Option<u32> {
+        if let Some(n) = self.reg_aliases.get(word) {
+            return Some(*n);
+        }
+        word.trim_start_matches(['R', 'r'])
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n < 16)
     }
 
     /// `«sym» # expr` — give the symbol the current `@`, then advance it.
@@ -2036,7 +2085,13 @@ impl<'a> Expander<'a> {
     /// sources routinely write `Go ROUT` and then `BL Go` from elsewhere.
     fn do_rout(&mut self, line: &Line) {
         self.define_label(line);
-        self.rout = line.label_str().map(|s| s.to_string());
+        // Substituted, because the label is almost always a macro parameter:
+        // `Entry` writes `$label ROUT`, and 3,493 routines in the corpus are
+        // named that way rather than by a literal label.
+        self.rout = line
+            .label_str()
+            .map(|s| strip_bars(&self.expand_text(s)))
+            .filter(|s| !s.is_empty());
     }
 
     /// `AREA name«,attr»...` starts a section; the location counter restarts.
@@ -2443,7 +2498,10 @@ impl<'a> Expander<'a> {
     /// separately, scoped to the enclosing `ROUT`.
     fn define_label(&mut self, line: &Line) {
         let Some(raw) = line.label_str() else { return };
-        let name = strip_bars(raw);
+        // A directive reaches here with its line unsubstituted -- only the
+        // statement path re-lexes after expanding -- so a label written as a
+        // macro parameter still says `$label` here.
+        let name = strip_bars(&self.expand_text(raw));
         if name.is_empty() {
             return;
         }
@@ -3620,5 +3678,111 @@ mod linkage_tests {
             "        IMPORT  OS_Write0\n        AREA x, CODE\n        END\n",
         );
         assert_eq!(got, vec!["OS_Write0".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod storage_map_addressing_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A storage map based on a register, as the sources write one.
+    const MAP: [&str; 7] = [
+        "        AREA    x, CODE, READONLY",
+        "wp      RN      12",
+        "        ^       0, wp",
+        "Slot1   #       4",
+        "Slot2   #       4",
+        "        ^       0",
+        "mfield  #       4",
+    ];
+
+    fn expand(tail: &[&str]) -> (Expander<'static>, Vec<ExpandedLine>) {
+        let mut lines: Vec<String> = MAP.iter().map(|s| s.to_string()).collect();
+        lines.extend(tail.iter().map(|s| s.to_string()));
+        lines.push("        END".into());
+        // The resolver outlives the call because nothing here reads a file.
+        let r: &'static MapResolver = Box::leak(Box::new(MapResolver(HashMap::new())));
+        let mut e = Expander::new(r);
+        let out = e.run("test", lines).expect("assembles");
+        (e, out)
+    }
+
+    /// What each instruction hands the encoder, which is what these rewrites
+    /// decide.
+    fn lowered(tail: &[&str]) -> Vec<String> {
+        let (e, out) = expand(tail);
+        out.iter()
+            .filter(|l| !l.listing_only)
+            .filter_map(|l| {
+                let lx = lex::lex_line(0, &l.text);
+                let op = lx.opcode_str()?.to_string();
+                let ops = e.encoder_operands(l, &op, lx.operands_str().unwrap_or(""));
+                Some(format!("{op} {ops}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_register_relative_symbol_names_memory_through_its_base() {
+        // `STR r0, Slot2` stores into the block `wp` points at, not to an
+        // address; left as a name the load would become program-relative.
+        assert_eq!(lowered(&["        STR     r0, Slot2"]), ["STR r0,[r12, #0x4]"]);
+    }
+
+    #[test]
+    fn an_expression_over_two_maps_keeps_the_based_one() {
+        // `scratchbuffer1 + ms_action`: one symbol is an offset from `wp`,
+        // the other an offset within the message block it names.
+        assert_eq!(
+            lowered(&["        LDR     r1, Slot2 + mfield"]),
+            ["LDR r1,[r12, #0x4]"]
+        );
+    }
+
+    #[test]
+    fn adr_keeps_the_name_because_it_wants_the_address_not_the_contents() {
+        // ADR on the same symbol is arithmetic on the base register, decided
+        // by the driver; folding it to a load would be the wrong instruction.
+        assert_eq!(lowered(&["        ADR     r2, Slot2"]), ["ADR r2, Slot2"]);
+    }
+
+    #[test]
+    fn the_base_may_be_named_by_an_alias() {
+        // `^ 0, wp` rather than `^ 0, r12`, which is how the sources write it.
+        let (e, _) = expand(&[]);
+        assert_eq!(e.field_bases().get("Slot2"), Some(&12));
+    }
+}
+
+#[cfg(test)]
+mod macro_label_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// `Entry` writes `$label ROUT`, so a routine's name reaches a directive
+    /// as a macro parameter. Directives are dispatched from the line before
+    /// substitution, so the label has to be expanded where it is read -- or
+    /// the three and a half thousand routines written that way have no name,
+    /// and every `ADR` at one of them has no target.
+    #[test]
+    fn a_label_written_as_a_macro_parameter_is_substituted() {
+        let src = [
+            "        AREA    x, CODE, READONLY",
+            "        MACRO",
+            "$label  Ent",
+            "$label  ROUT",
+            "        MOV     r0, #0",
+            "        MEND",
+            "        MOV     r1, #1",
+            "Target  Ent",
+            "        END",
+        ];
+        let r = MapResolver(HashMap::new());
+        let mut e = Expander::new(&r);
+        e.run("test", src.iter().map(|s| s.to_string()).collect())
+            .expect("assembles");
+        assert_eq!(e.label_defs().get("Target").map(|(_, a)| *a), Some(4));
+        assert!(!e.label_defs().contains_key("$label"));
     }
 }
