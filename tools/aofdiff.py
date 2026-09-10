@@ -436,10 +436,19 @@ def collect(root, build, ref_dir, count):
     us = units(root)
     if count:
         us = us[:count]
+    # Only what is not already there, so a collection is extended in small
+    # batches rather than started again. A unit that has a log has been
+    # asked, whether or not it produced an object.
+    todo = [u for u in us if not os.path.isfile(reference_paths(ref_dir, root, u)[1])]
+    done = len(us) - len(todo)
+    if done:
+        print(f"{done} already collected, {len(todo)} to go", flush=True)
+    if not todo:
+        return 0
     sh = Shell(quiet=True)
     sh.boot()
     kept = failed = 0
-    for n, unit in enumerate(us, 1):
+    for n, unit in enumerate(todo, 1):
         obj_path, log_path = reference_paths(ref_dir, root, unit)
         os.makedirs(os.path.dirname(obj_path), exist_ok=True)
         try:
@@ -448,7 +457,10 @@ def collect(root, build, ref_dir, count):
             theirs, log = objasm(sh, unit, predefines, "", setup.variables, setup.hdrdirs)
         except OSError as e:
             # Staging, not the emulator: lose one unit and keep the instance.
-            print(f"[staging failed for {unit}: {e}]", file=sys.stderr)
+            # Named, because "Invalid argument" on its own says nothing about
+            # which file the host would not have.
+            where = f" on {e.filename}" if getattr(e, "filename", None) else ""
+            print(f"[staging failed for {unit}: {e}{where}]", file=sys.stderr)
             continue
         except Exception as e:
             print(f"[restart after {unit}: {e}]", file=sys.stderr)
@@ -467,13 +479,13 @@ def collect(root, build, ref_dir, count):
             shutil.copy2(theirs, obj_path)
             kept += 1
         if n % 10 == 0:
-            print(f"  {n}/{len(us)}  {kept} kept, {failed} refused", flush=True)
+            print(f"  {n}/{len(todo)}  {kept} kept, {failed} refused", flush=True)
     try:
         sh.close()
     except Exception:
         pass
     print()
-    print(f"units            {len(us)}")
+    print(f"units asked      {len(todo)}")
     print(f"objects kept     {kept}")
     print(f"ObjAsm refused   {failed}")
     print(f"written to {ref_dir}")
