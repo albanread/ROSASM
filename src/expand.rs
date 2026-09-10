@@ -1815,7 +1815,18 @@ impl<'a> Expander<'a> {
                             None => continue,
                         }
                     } else {
-                        FixupKind::External(expr.trim().to_string())
+                        // The name the linker has to match, not the text
+                        // it was written as: `DCD |Image$$RO$$Base|`
+                        // asks for `Image$$RO$$Base`, and the bars are
+                        // delimiters that no symbol table carries.
+                        match identifiers(&expr)
+                            .into_iter()
+                            .find(|n| self.imports.contains(n))
+                            .or_else(|| identifiers(&expr).into_iter().next())
+                        {
+                            Some(n) => FixupKind::External(n),
+                            None => continue,
+                        }
                     };
                     self.data_fixups.push(DataFixup {
                         area: l.area_index,
@@ -3574,5 +3585,40 @@ mod literal_pool_tests {
         // inside brackets either way.
         let src = format!("{HEAD}        LDR r0, [r1, #4]\n        LTORG\n        END\n");
         assert!(pool(&src).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod linkage_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn imports_of(src: &str) -> Vec<String> {
+        let lines: Vec<String> = src.lines().map(|s| s.to_string()).collect();
+        let r = MapResolver(HashMap::new());
+        let mut e = Expander::new(&r);
+        e.run("test", lines).expect("assembles");
+        e.imports().to_vec()
+    }
+
+    #[test]
+    fn bars_are_delimiters_not_part_of_an_imported_name() {
+        // `IMPORT |Image$$RO$$Base|` names the symbol `Image$$RO$$Base`, and
+        // the linker will not match it if the bars are kept.
+        let got = imports_of(
+            "        IMPORT  |Image$$RO$$Base|\n\
+             \x20       AREA    x, DATA, REL\n\
+             \x20       DCD     |Image$$RO$$Base|\n\
+             \x20       END\n",
+        );
+        assert_eq!(got, vec!["Image$$RO$$Base".to_string()]);
+    }
+
+    #[test]
+    fn an_unbarred_import_is_unchanged() {
+        let got = imports_of(
+            "        IMPORT  OS_Write0\n        AREA x, CODE\n        END\n",
+        );
+        assert_eq!(got, vec!["OS_Write0".to_string()]);
     }
 }

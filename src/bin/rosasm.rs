@@ -520,6 +520,16 @@ fn main() {
     // Copy each line's bytes into its area, remembering where the encoder's
     // output landed so its fixups can be found again.
     let mut segments: Vec<Segment> = Vec::new();
+    // Where each area changes between code and data, for the mapping symbols
+    // ObjAsm emits: `$a` where ARM instructions start, `$d` where data does.
+    // A disassembler cannot tell them apart without these, and the linker
+    // uses them to decide what it may not reorder.
+    let mut mapping: Vec<(usize, u32, char)> = Vec::new();
+    let note = |area: usize, at: u32, kind: char, m: &mut Vec<(usize, u32, char)>| {
+        if m.iter().rev().find(|(a, _, _)| *a == area).map(|(_, _, k)| *k) != Some(kind) {
+            m.push((area, at, kind));
+        }
+    };
     for (i, l) in lines.iter().enumerate() {
         if l.listing_only {
             continue;
@@ -530,6 +540,7 @@ fn main() {
         let zero_init = area.attributes & area_attr::ZERO_INIT != 0;
         if !l.bytes.is_empty() {
             if !zero_init {
+                note(l.area_index, area.data.len() as u32, 'd', &mut mapping);
                 area.data.extend_from_slice(&l.bytes);
             }
             continue;
@@ -546,6 +557,7 @@ fn main() {
                 .min()
                 .unwrap_or(text.len());
             if !zero_init && to <= text.len() && from < to {
+                note(l.area_index, area.data.len() as u32, 'a', &mut mapping);
                 segments.push(Segment {
                     text: from..to,
                     area: l.area_index,
@@ -604,6 +616,30 @@ fn main() {
         if !symbols.iter().any(|s| s.name == *name) {
             symbols.push(external(name));
         }
+    }
+    // Every area carries its own name as a local symbol, and the points where
+    // it changes between code and data carry `$a` and `$d`. Local, because
+    // they describe the object rather than offering anything to the linker to
+    // resolve; ObjAsm emits both and a disassembler expects them.
+    for a in &areas {
+        symbols.push(aof::Symbol {
+            name: a.name.clone(),
+            attributes: sym_attr::DEFINED,
+            value: 0,
+            area: Some(a.name.clone()),
+        });
+    }
+    for (area, at, kind) in &mapping {
+        let Some(a) = areas.get(*area) else { continue };
+        symbols.push(aof::Symbol {
+            name: format!("${kind}"),
+            // `$d` says the bytes after it are a datum, which is exactly what
+            // the <code datum> attribute records.
+            attributes: sym_attr::DEFINED
+                | if *kind == 'd' { sym_attr::CODE_DATUM } else { 0 },
+            value: *at,
+            area: Some(a.name.clone()),
+        });
     }
 
     // Relocations. The encoder reports every field it could not fix; each is

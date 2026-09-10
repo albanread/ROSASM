@@ -115,6 +115,9 @@ pub mod sym_attr {
     pub const WEAK: u32 = 0x10;
     pub const STRONG: u32 = 0x20;
     pub const COMMON: u32 = 0x40;
+    /// The symbol marks a datum rather than an instruction. The spec calls it
+    /// meaningful only inside a code area; ObjAsm sets it on every `$d`.
+    pub const CODE_DATUM: u32 = 0x100;
 }
 
 /// What a relocation directive modifies.
@@ -152,7 +155,8 @@ pub struct Reloc {
 }
 
 impl Reloc {
-    fn flags(&self) -> u32 {
+    /// The flag word as it is written, which is also its identity.
+    pub fn flags(&self) -> u32 {
         let (a_bit, sid) = match self.by {
             RelocBy::Area(i) => (0, i),
             RelocBy::Symbol(i) => (1 << 27, i),
@@ -382,6 +386,104 @@ impl Object {
         }
         out
     }
+}
+
+// ----------------------------------------------------------------- identity
+
+/// A hash of everything about an object that a compiler is responsible for.
+///
+/// Two assemblers given the same source should produce the same bytes, the
+/// same areas with the same attributes, the same symbols and the same
+/// relocations. This folds exactly that into one number, so a corpus of a
+/// thousand units can be checked against a reference with a thousand
+/// comparisons rather than a thousand diffs -- and the diff is only needed
+/// where the number disagrees.
+///
+/// What it deliberately leaves out is everything a *producer* is responsible
+/// for: the identification string naming the tool and its version, the order
+/// the chunks were written in, and the padding between them. Those differ
+/// between any two assemblers and say nothing about whether the code is the
+/// same.
+///
+/// Nor does it use a relocation's symbol index. An index is a position in the
+/// file's own table, so two objects that agree in every particular still carry
+/// different numbers whenever their tables are ordered differently -- and they
+/// are, since ObjAsm lists its imports before the mapping symbols and nothing
+/// requires that. What is hashed is the name the relocation refers to.
+///
+/// FNV-1a, because this detects difference rather than resisting anyone
+/// trying to manufacture a collision.
+impl Object {
+    /// What a relocation refers to, by name rather than by position.
+    pub fn name_of(&self, by: RelocBy) -> String {
+        match by {
+            RelocBy::Symbol(i) => self
+                .symbols
+                .get(i as usize)
+                .map(|s| format!("symbol {}", s.name))
+                .unwrap_or_else(|| format!("symbol #{i}")),
+            RelocBy::Area(i) => self
+                .areas
+                .get(i as usize)
+                .map(|a| format!("area {}", a.name))
+                .unwrap_or_else(|| format!("area #{i}")),
+        }
+    }
+}
+
+pub fn content_hash(o: &Object) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    for a in &o.areas {
+        eat(a.name.as_bytes());
+        eat(&a.attributes.to_le_bytes());
+        eat(&[a.alignment]);
+        eat(&a.reserved.to_le_bytes());
+        eat(&a.data);
+        // Sorted, because two assemblers may record them in either order and
+        // the linker does not care which.
+        let mut rs: Vec<(u32, u32, String)> = a
+            .relocs
+            .iter()
+            .map(|r| {
+                // The flag word without the 24-bit index, which is a position
+                // rather than a fact about the code.
+                let shape = r.flags() & !0x00FF_FFFF;
+                (r.offset, shape, o.name_of(r.by))
+            })
+            .collect();
+        rs.sort_unstable();
+        for (off, shape, name) in rs {
+            eat(&off.to_le_bytes());
+            eat(&shape.to_le_bytes());
+            eat(name.as_bytes());
+        }
+    }
+    let mut syms: Vec<(&str, u32, u32, &str)> = o
+        .symbols
+        .iter()
+        .map(|s| {
+            (
+                s.name.as_str(),
+                s.attributes,
+                s.value,
+                s.area.as_deref().unwrap_or(""),
+            )
+        })
+        .collect();
+    syms.sort_unstable();
+    for (n, attr, v, area) in syms {
+        eat(n.as_bytes());
+        eat(&attr.to_le_bytes());
+        eat(&v.to_le_bytes());
+        eat(area.as_bytes());
+    }
+    h
 }
 
 // ----------------------------------------------------------------- reading
@@ -881,5 +983,143 @@ mod roundtrip_tests {
     #[test]
     fn a_file_that_is_not_a_chunk_file_is_refused() {
         assert!(read(b"not an object at all").is_err());
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+
+    fn object() -> Object {
+        let mut code = Area::new("C$$code", area_attr::CODE | area_attr::READ_ONLY);
+        code.data = vec![0x01, 0x00, 0xA0, 0xE3, 0x0E, 0xF0, 0xA0, 0xE1];
+        code.relocs.push(Reloc {
+            offset: 0,
+            by: RelocBy::Symbol(0),
+            field: FieldType::Instruction,
+            pc_relative: true,
+            based: false,
+            max_instructions: 1,
+        });
+        Object {
+            areas: vec![code],
+            symbols: vec![Symbol {
+                name: "start".into(),
+                attributes: sym_attr::DEFINED | sym_attr::GLOBAL,
+                value: 0,
+                area: Some("C$$code".into()),
+            }],
+            entry: None,
+            identification: "rosasm".into(),
+        }
+    }
+
+    #[test]
+    fn the_same_content_hashes_the_same() {
+        assert_eq!(content_hash(&object()), content_hash(&object()));
+    }
+
+    #[test]
+    fn the_producer_is_not_part_of_the_content() {
+        // Two assemblers name themselves differently and that is not a
+        // difference in the code they made.
+        let mut other = object();
+        other.identification = "ObjAsm 4.08".into();
+        assert_eq!(content_hash(&object()), content_hash(&other));
+    }
+
+    #[test]
+    fn a_single_changed_byte_shows() {
+        let mut other = object();
+        other.areas[0].data[0] ^= 1;
+        assert_ne!(content_hash(&object()), content_hash(&other));
+    }
+
+    #[test]
+    fn relocations_hash_the_same_in_either_order() {
+        let mut a = object();
+        let mut b = object();
+        let extra = Reloc {
+            offset: 4,
+            by: RelocBy::Area(0),
+            field: FieldType::Word,
+            pc_relative: false,
+            based: false,
+            max_instructions: 0,
+        };
+        a.areas[0].relocs.push(extra.clone());
+        b.areas[0].relocs.insert(0, extra);
+        assert_eq!(content_hash(&a), content_hash(&b));
+    }
+
+    #[test]
+    fn a_moved_symbol_shows() {
+        let mut other = object();
+        other.symbols[0].value = 4;
+        assert_ne!(content_hash(&object()), content_hash(&other));
+    }
+
+    #[test]
+    fn an_area_attribute_is_part_of_it() {
+        let mut other = object();
+        other.areas[0].attributes |= area_attr::REENTRANT;
+        assert_ne!(content_hash(&object()), content_hash(&other));
+    }
+}
+
+#[cfg(test)]
+mod hash_ordering_tests {
+    use super::*;
+
+    /// Two files agreeing in every particular, whose symbol tables are in
+    /// different orders -- which is what ObjAsm and this assembler produce.
+    fn pair() -> (Object, Object) {
+        let sym = |n: &str, a: u32| Symbol {
+            name: n.into(),
+            attributes: a,
+            value: 0,
+            area: Some("c".into()),
+        };
+        let reloc = |sid: u32| Reloc {
+            offset: 0,
+            by: RelocBy::Symbol(sid),
+            field: FieldType::Word,
+            pc_relative: false,
+            based: false,
+            max_instructions: 0,
+        };
+        let mut a = Area::new("c", area_attr::CODE);
+        a.data = vec![0, 0, 0, 0];
+        let mut b = a.clone();
+        // Both relocate by `wanted`; it sits at a different index in each.
+        a.relocs.push(reloc(0));
+        b.relocs.push(reloc(1));
+        (
+            Object {
+                areas: vec![a],
+                symbols: vec![sym("wanted", sym_attr::GLOBAL), sym("other", sym_attr::DEFINED)],
+                entry: None,
+                identification: "ours".into(),
+            },
+            Object {
+                areas: vec![b],
+                symbols: vec![sym("other", sym_attr::DEFINED), sym("wanted", sym_attr::GLOBAL)],
+                entry: None,
+                identification: "ObjAsm".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_relocation_is_identified_by_name_not_by_index() {
+        let (a, b) = pair();
+        assert_eq!(content_hash(&a), content_hash(&b));
+    }
+
+    #[test]
+    fn relocating_by_a_different_symbol_still_shows() {
+        let (a, mut b) = pair();
+        b.areas[0].relocs[0].by = RelocBy::Symbol(0); // now `other`
+        assert_ne!(content_hash(&a), content_hash(&b));
     }
 }
