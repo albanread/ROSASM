@@ -150,7 +150,9 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>, Vec<Adr
         }
         // `SWI OS_Write0` names the SWI, and the name is a symbol from a
         // header; UAL wants an immediate, so mark it as one to evaluate.
-        let raw = lx.operands_str().unwrap_or("");
+        // The operands as the expander froze them, not as the line reads:
+        // a variable an operand names may have been rewritten since.
+        let raw: &str = &l.operands;
         let raw = if rosasm::lower::is_swi(op) && !raw.trim_start().starts_with('#') {
             format!("#{raw}")
         } else {

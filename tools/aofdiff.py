@@ -328,6 +328,17 @@ def one(root, unit, build, keep, limit, full=False):
     return 0 if verdict == "same" else 1
 
 
+def write_row(report, verdict, label, detail):
+    """One unit's verdict, on disc before the next one starts."""
+    if report is None:
+        return
+    report.write(f"{verdict:14} {label}\n")
+    if verdict != "same":
+        for line in (detail or "").splitlines():
+            report.write(f"    {line}\n")
+    report.flush()
+
+
 def many(root, build, limit, count, out):
     """Every unit, through one emulator session.
 
@@ -344,6 +355,10 @@ def many(root, build, limit, count, out):
     sh.boot()
     tally = {}
     rows = []
+    # Written as they are decided, not at the end. A run is hours long, and
+    # one that has to be stopped part way through should still have said
+    # everything it found.
+    report = open(out, "w", encoding="utf-8") if out else None
     for n, unit in enumerate(us, 1):
         label = os.path.relpath(unit, os.path.join(root, "Sources"))
         try:
@@ -352,6 +367,7 @@ def many(root, build, limit, count, out):
             # Staging, not the emulator: keep the instance and lose one unit.
             tally["staging-failed"] = tally.get("staging-failed", 0) + 1
             rows.append(("staging-failed", label, str(e)))
+            write_row(report, "staging-failed", label, str(e))
             print(f"[staging failed for {label}: {e}]", file=sys.stderr)
             continue
         except Exception as e:
@@ -366,6 +382,7 @@ def many(root, build, limit, count, out):
             verdict, detail = "emulator-died", str(e)
         tally[verdict] = tally.get(verdict, 0) + 1
         rows.append((verdict, label, detail))
+        write_row(report, verdict, label, detail)
         if n % 10 == 0:
             print(f"  {n}/{len(us)}  {tally}", flush=True)
     try:
@@ -385,13 +402,8 @@ def many(root, build, limit, count, out):
     if both:
         print(f"\nof the {both} both assembled, {agreed} are identical "
               f"({100 * agreed / both:.1f}%)")
-    if out:
-        with open(out, "w", encoding="utf-8") as f:
-            for verdict, label, detail in rows:
-                f.write(f"{verdict:14} {label}\n")
-                if verdict != "same":
-                    for line in detail.splitlines():
-                        f.write(f"    {line}\n")
+    if report is not None:
+        report.close()
         print(f"written to {out}")
     return 0 if tally.get("differ", 0) == 0 else 1
 

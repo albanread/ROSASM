@@ -184,6 +184,7 @@ mod tests {
 
     fn el(line: usize, addr: u32, bytes: Vec<u8>, text: &str) -> ExpandedLine {
         ExpandedLine {
+            operands: String::new(),
             text: text.to_string(),
             origin: Origin { file: "t".into(), line, macros: vec![] },
             addr,
@@ -306,6 +307,7 @@ mod byte_layout_tests {
         // ObjAsm's shape: number and address on the first row, source text
         // against the last, byte groups on every row.
         let l = ExpandedLine {
+            operands: String::new(),
             text: "DEV_ID  = &01, &03, &61, &00, &ff".into(),
             origin: Origin { file: "t".into(), line: 32, macros: vec![] },
             addr: 0,

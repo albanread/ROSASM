@@ -48,6 +48,16 @@ pub struct Origin {
 
 #[derive(Debug, Clone)]
 pub struct ExpandedLine {
+    /// The operands with every assembly-time variable replaced by the value
+    /// it held on this line. Empty for a line with none.
+    ///
+    /// A variable is what `SETA` and its family write, and it changes. The
+    /// `Entry` macro sets `Proc_LocalStack` from its argument, and the next
+    /// routine's `Entry` overwrites it: reading the operands of `SUB sp, sp,
+    /// #Proc_LocalStack` after the whole file has been expanded finds
+    /// whatever the last macro left there, which is how a routine with a
+    /// 256-byte frame came out subtracting nothing.
+    pub operands: String,
     /// The line after substitution, exactly as ObjAsm would list it — the
     /// expression text is *not* rewritten. ObjAsm lists `DCD 10 + 1` and puts
     /// `0000000B` in the byte column; matching its listing means doing the
@@ -560,6 +570,56 @@ pub fn identifiers(s: &str) -> Vec<String> {
     out
 }
 
+/// Rewrite the names in an expression, leaving quoted text alone.
+///
+/// A name may be written between bars -- `|_Lib$Reloc$Off$DP|` -- where the
+/// bars are delimiters and not part of it, so they are read here rather than
+/// left for a caller to trip over.
+fn map_names(text: &str, mut f: impl FnMut(&str) -> Option<String>) -> String {
+    let cs: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut i = 0;
+    while i < cs.len() {
+        // A quoted string is not an expression.
+        if cs[i] == '"' {
+            out.push(cs[i]);
+            i += 1;
+            while i < cs.len() {
+                out.push(cs[i]);
+                i += 1;
+                if cs[i - 1] == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        let (name, end, barred) = if cs[i] == '|' {
+            let mut j = i + 1;
+            while j < cs.len() && cs[j] != '|' {
+                j += 1;
+            }
+            (cs[i + 1..j].iter().collect::<String>(), (j + 1).min(cs.len()), true)
+        } else if cs[i].is_alphabetic() || cs[i] == '_' {
+            let mut j = i;
+            while j < cs.len() && (cs[j].is_alphanumeric() || "_$".contains(cs[j])) {
+                j += 1;
+            }
+            (cs[i..j].iter().collect::<String>(), j, false)
+        } else {
+            out.push(cs[i]);
+            i += 1;
+            continue;
+        };
+        match f(&name) {
+            Some(replacement) => out.push_str(&replacement),
+            None if barred => out.push_str(&format!("|{name}|")),
+            None => out.push_str(&name),
+        }
+        i = end;
+    }
+    out
+}
+
 /// Where a data line stands, for the `.` and the local labels in its items.
 struct DataSite {
     addr: u32,
@@ -938,6 +998,7 @@ impl<'a> Expander<'a> {
         let rout = self.rout.clone();
         let origin = self.origin(line_num);
         self.out.push(ExpandedLine {
+            operands: String::new(),
             text: String::new(),
             origin,
             addr: from,
@@ -960,6 +1021,7 @@ impl<'a> Expander<'a> {
         let origin = self.origin(line_num);
         let bytes = self.close_pool(line_num)?;
         self.out.push(ExpandedLine {
+            operands: String::new(),
             text: String::new(),
             origin,
             addr,
@@ -1753,6 +1815,7 @@ impl<'a> Expander<'a> {
             let area_index = self.current_area_index();
             let rout = self.rout.clone();
             self.out.push(ExpandedLine {
+                operands: String::new(),
                 text,
                 origin,
                 addr,
@@ -1925,6 +1988,7 @@ impl<'a> Expander<'a> {
         let origin = self.origin(line.num);
         let area_index = self.current_area_index();
         self.out.push(ExpandedLine {
+            operands: String::new(),
             text,
             origin,
             addr,
@@ -2015,8 +2079,13 @@ impl<'a> Expander<'a> {
             if l.listing_only || l.bytes.is_empty() {
                 continue;
             }
+            // Re-lexed from the frozen operands, not from the line as it
+            // reads: `DCD Proc_LocalStack` has to hold the value that
+            // variable had here, not the one the last macro left in it.
             let relexed = lex::lex_line(l.origin.line, &l.text);
-            let Some(op) = relexed.opcode_str() else { continue };
+            let Some(op) = relexed.opcode_str().map(|s| s.to_string()) else { continue };
+            let relexed = lex::lex_line(l.origin.line, &format!("        {op} {}", l.operands));
+            let op: &str = &op;
             if matches!(
                 op.to_ascii_uppercase().as_str(),
                 "DCD" | "DCB" | "DCW" | "DCQ" | "DCI" | "&" | "="
@@ -2557,7 +2626,12 @@ impl<'a> Expander<'a> {
                 // what has to go there.
                 _ => {
                     holes.push((out.len() as u32, width as u8, t.to_string(), false));
-                    0
+                    // An imported symbol has no value here, but the rest of
+                    // the expression has one and the relocation is additive.
+                    match self.eval_expr(&self.without_imports(t)) {
+                        Ok(Value::Arith(n)) => n as u64,
+                        _ => 0,
+                    }
                 }
             };
             for b in 0..width {
@@ -2751,39 +2825,37 @@ impl<'a> Expander<'a> {
 
     /// The expression with every label of one area moved along by `by`.
     fn shift_labels(&self, text: &str, area: usize, by: u32) -> String {
-        let cs: Vec<char> = text.chars().collect();
-        let mut out = String::with_capacity(text.len() + 16);
-        let mut i = 0;
-        while i < cs.len() {
-            // A quoted string is not an expression.
-            if cs[i] == '"' {
-                out.push(cs[i]);
-                i += 1;
-                while i < cs.len() {
-                    out.push(cs[i]);
-                    i += 1;
-                    if cs[i - 1] == '"' {
-                        break;
-                    }
-                }
-                continue;
+        map_names(text, |n| match self.label_defs.get(n) {
+            Some((a, _)) if *a == area => Some(format!("({n}+{by})")),
+            _ => None,
+        })
+    }
+
+    /// The operand text with every assembly-time variable replaced by the
+    /// value it holds here.
+    ///
+    /// Labels and `EQU` symbols are left as names: a label has to stay one
+    /// for the address folding to recognise it, and neither can change once
+    /// set. Only what `SETA` and its family write is frozen, because only
+    /// that is rewritten as the file goes on.
+    fn freeze_variables(&self, text: &str) -> String {
+        map_names(text, |n| match self.syms.get(n) {
+            Some(Value::Arith(v)) => Some(v.to_string()),
+            Some(Value::Logical(b)) => {
+                Some(if *b { "{TRUE}" } else { "{FALSE}" }.to_string())
             }
-            if !(cs[i].is_alphabetic() || cs[i] == '_') {
-                out.push(cs[i]);
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < cs.len() && (cs[i].is_alphanumeric() || "_$".contains(cs[i])) {
-                i += 1;
-            }
-            let name: String = cs[start..i].iter().collect();
-            match self.label_defs.get(&name) {
-                Some((a, _)) if *a == area => out.push_str(&format!("({name}+{by})")),
-                _ => out.push_str(&name),
-            }
-        }
-        out
+            _ => None,
+        })
+    }
+
+    /// The expression with every imported name standing at zero.
+    ///
+    /// What the linker will supply is not known here; what the source wrote
+    /// around it is. `DCD |_Lib$Reloc$Off$DP| + &E28AA000` is ShellCLI
+    /// building an instruction by hand, and the word it wants in the object
+    /// is that constant, with the relocation to add the rest.
+    fn without_imports(&self, text: &str) -> String {
+        map_names(text, |n| self.imports.contains(&n.to_string()).then(|| "0".into()))
     }
 
     /// How a value naming a symbol has to be relocated, if at all.
@@ -3114,6 +3186,9 @@ impl<'a> Expander<'a> {
             }
         }
         if relexed.kind == Kind::Statement {
+            // Read here, while the variables an operand names still hold the
+            // values this line was written with.
+            let operands = self.freeze_variables(relexed.operands_str().unwrap_or(""));
             // Before the address is read, because padding moves it.
             self.pad_to(Self::alignment_of(&relexed), line.num);
             let mut addr = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
@@ -3137,6 +3212,7 @@ impl<'a> Expander<'a> {
             let area_index = self.current_area_index();
             let rout = self.rout.clone();
             self.out.push(ExpandedLine {
+                operands,
                 text,
                 origin,
                 addr,
