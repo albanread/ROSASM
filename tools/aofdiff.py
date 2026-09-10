@@ -139,6 +139,7 @@ def stage_unit(unit, generated):
         src = os.path.join(comp, name)
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(STAGE, name), dirs_exist_ok=True)
+            both_ways(src, name)
     # And the loose files at the component's root. `VersionASM` is one, and
     # ninety other components have one: `GET VersionASM` names it with no
     # directory, so it has to sit where `-i` points. Assembling here finds it
@@ -155,6 +156,25 @@ def stage_unit(unit, generated):
             if os.path.isdir(d):
                 shutil.copytree(d, STAGE, dirs_exist_ok=True)
     return comp
+
+
+def both_ways(src, kind):
+    """Offer a component's own headers under the other spelling too.
+
+    The sources ask for one of their headers both ways round -- `GET
+    hdr.WIMPMacros` and `GET BCM2835.hdr` -- and ObjAsm reads the second
+    literally: directory `BCM2835`, file `hdr`. The git tree holds it as
+    `hdr/BCM2835`, so a component that writes it that way fails on its first
+    header and then on everything the header would have defined. Both
+    spellings are staged and ObjAsm can have whichever it asks for.
+    """
+    for name in os.listdir(src):
+        f = os.path.join(src, name)
+        if not os.path.isfile(f):
+            continue
+        d = os.path.join(STAGE, name)
+        os.makedirs(d, exist_ok=True)
+        shutil.copy2(f, os.path.join(d, kind))
 
 
 def via_file(predefines):
@@ -189,7 +209,12 @@ def objasm(sh, unit, predefines, extra_i, variables, hdrdirs):
     """
     name = os.path.basename(unit)
     sh.cmd("HostFS")
-    sh.cmd("Dir HostFS::HostFS.$")
+    # From the component's own directory, which is where the build runs it.
+    # The sources spell a header of their own both ways round -- `GET
+    # hdr.WIMPMacros` and `GET BCM2835.hdr` -- and the reversed spelling is
+    # resolved against the current directory. Run from anywhere else it has
+    # nowhere to land, and a whole component fails on its first header.
+    sh.cmd(f"Dir HostFS::HostFS.$.{STAGE_NAME}")
     for k, v in sorted(variables.items()):
         sh.cmd(f"Set {k} {v}")
     root = "HostFS::HostFS.$"
@@ -198,8 +223,8 @@ def objasm(sh, unit, predefines, extra_i, variables, hdrdirs):
     # rather than listing them keeps `Interface2` -- which the build has and
     # which was missing here -- from being dropped again.
     exported = "".join(f",{root}.{HDR_NAME}.{os.path.basename(d)}." for d in hdrdirs)
-    sh.cmd(f"Set Hdr$Path {root}.{STAGE_NAME}.hdr.{exported}")
-    via = via_file(predefines)
+    sh.cmd(f"Set Hdr$Path @.hdr.{exported}")
+    via_file(predefines)
     # Redirected into a file rather than read off the screen. ObjAsm prints
     # the offending listing line before each error, so a unit with twenty
     # errors says four times more than a terminal holds, and the one line
@@ -215,15 +240,17 @@ def objasm(sh, unit, predefines, extra_i, variables, hdrdirs):
     # more often write `GET ListOpts` bare, and that is resolved against the
     # include list. Without it every header a unit reads this way is missing,
     # which arrives as an unknown opcode wherever one of its macros is used.
-    includes = f" -i {STAGE_NAME} -i {STAGE_NAME}.hdr" + "".join(
-        f" -i {HDR_NAME}.{os.path.basename(d)}" for d in hdrdirs
+    includes = " -i @ -i hdr" + "".join(
+        f" -i {root}.{HDR_NAME}.{os.path.basename(d)}" for d in hdrdirs
     )
     cmd = (
-        f"Run {OBJASM} -via {via} -o {STAGE_NAME}.o.{name}"
-        f"{includes}{extra_i} {STAGE_NAME}.s.{name}"
-        f" {{ > {STAGE_NAME}.log }}"
+        f"Run {OBJASM} -via via -o o.{name}"
+        f"{includes}{extra_i} s.{name}"
+        " { > log }"
     )
-    screen = sh.cmd(cmd, settle=1.0, max_wait=180.0)
+    # The output is redirected, so nothing reaches the screen until the
+    # prompt comes back; quiescence means nothing here.
+    screen = sh.cmd(cmd, settle=1.0, max_wait=120.0, require_prompt=True)
     out = screen
     deadline = time.time() + 5.0
     while not os.path.isfile(log) and time.time() < deadline:
@@ -421,7 +448,15 @@ def reference_paths(ref_dir, root, unit):
     return base + ".o", base + ".log"
 
 
-def collect(root, build, ref_dir, count):
+def chosen(us, only):
+    """The units whose path contains `only`, for working on one component."""
+    if not only:
+        return us
+    needle = only.replace(chr(92), "/").lower()
+    return [u for u in us if needle in u.replace(chr(92), "/").lower()]
+
+
+def collect(root, build, ref_dir, count, only=None):
     """ObjAsm over every unit, once, keeping what it produces.
 
     ObjAsm's answer depends on the sources and on nothing else. It is the
@@ -433,7 +468,7 @@ def collect(root, build, ref_dir, count):
     from corpus_diff import units
 
     setup = Setup(root, build)
-    us = units(root)
+    us = chosen(units(root), only)
     if count:
         us = us[:count]
     # Only what is not already there, so a collection is extended in small
@@ -451,25 +486,51 @@ def collect(root, build, ref_dir, count):
     for n, unit in enumerate(todo, 1):
         obj_path, log_path = reference_paths(ref_dir, root, unit)
         os.makedirs(os.path.dirname(obj_path), exist_ok=True)
-        try:
-            predefines, generated = setup.inputs_for(unit)
-            stage_unit(unit, generated)
-            theirs, log = objasm(sh, unit, predefines, "", setup.variables, setup.hdrdirs)
-        except OSError as e:
-            # Staging, not the emulator: lose one unit and keep the instance.
-            # Named, because "Invalid argument" on its own says nothing about
-            # which file the host would not have.
-            where = f" on {e.filename}" if getattr(e, "filename", None) else ""
-            print(f"[staging failed for {unit}: {e}{where}]", file=sys.stderr)
-            continue
-        except Exception as e:
-            print(f"[restart after {unit}: {e}]", file=sys.stderr)
+        # Twice at most. A unit that leaves the emulator not answering takes
+        # the next one down with it, and a fresh instance usually assembles it
+        # -- but if it does not, the collection has to move on and say so
+        # rather than stop here or come back to it every run.
+        theirs = log = None
+        staging = False
+        for attempt in (1, 2):
             try:
-                sh.close()
-            except Exception:
-                pass
-            sh = Shell(quiet=True)
-            sh.boot()
+                predefines, generated = setup.inputs_for(unit)
+                stage_unit(unit, generated)
+                theirs, log = objasm(
+                    sh, unit, predefines, "", setup.variables, setup.hdrdirs
+                )
+                break
+            except TimeoutError as e:
+                # Before OSError, which it is a kind of: an emulator that
+                # never came back to the prompt is not a staging problem.
+                print(f"[restart after {unit}: {e}]", file=sys.stderr)
+                try:
+                    sh.close()
+                except Exception:
+                    pass
+                sh = Shell(quiet=True)
+                sh.boot()
+                if attempt == 2:
+                    log = f"[the emulator stopped answering twice: {e}]"
+            except OSError as e:
+                # Staging, not the emulator: lose one unit, keep the instance.
+                # Named, because "Invalid argument" on its own says nothing
+                # about which file the host would not have.
+                where = f" on {e.filename}" if getattr(e, "filename", None) else ""
+                print(f"[staging failed for {unit}: {e}{where}]", file=sys.stderr)
+                staging = True
+                break
+            except Exception as e:
+                print(f"[restart after {unit}: {e}]", file=sys.stderr)
+                try:
+                    sh.close()
+                except Exception:
+                    pass
+                sh = Shell(quiet=True)
+                sh.boot()
+                if attempt == 2:
+                    log = f"[the emulator stopped answering twice: {e}]"
+        if staging:
             continue
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(log or "")
@@ -492,12 +553,12 @@ def collect(root, build, ref_dir, count):
     return 0
 
 
-def against(root, build, ref_dir, limit, count, out):
+def against(root, build, ref_dir, limit, count, out, only=None):
     """Compare with the reference set, which needs no emulator at all."""
     from corpus_diff import units
 
     setup = Setup(root, build, stage=False)
-    us = units(root)
+    us = chosen(units(root), only)
     if count:
         us = us[:count]
     tally = {}
@@ -570,11 +631,14 @@ def main():
         metavar="DIR",
         help="compare with a collected set, without the emulator",
     )
+    ap.add_argument(
+        "--only", metavar="TEXT", help="units whose path contains this"
+    )
     a = ap.parse_args()
     if a.collect:
-        raise SystemExit(collect(a.root, a.build, a.collect, a.limit))
+        raise SystemExit(collect(a.root, a.build, a.collect, a.limit, a.only))
     if a.against:
-        raise SystemExit(against(a.root, a.build, a.against, a.n, a.limit, a.out))
+        raise SystemExit(against(a.root, a.build, a.against, a.n, a.limit, a.out, a.only))
     if a.all:
         raise SystemExit(many(a.root, a.build, a.n, a.limit, a.out))
     if not a.unit:

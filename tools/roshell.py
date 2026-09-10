@@ -58,10 +58,37 @@ def claim(cwd):
             "it first -- two instances share one HostFS tree and would "
             "quietly corrupt each other's staging"
         )
+    # A driver that was killed leaves its emulator behind, and an orphan is
+    # invisible to the lock: it has no live process to name. It is still
+    # sharing the HostFS tree, so it is stopped here rather than left to
+    # corrupt the run that is about to start.
+    orphans(cwd)
     with open(path, "w") as f:
         f.write(str(os.getpid()))
     HELD.add(key)
     return path
+
+
+def orphans(cwd):
+    """Stop any emulator running from this directory with no driver left."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq rpcemu-headless.exe", "/NH"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    pids = [
+        line.split()[1]
+        for line in out.splitlines()
+        if line.strip().lower().startswith("rpcemu-headless.exe")
+    ]
+    for pid in pids:
+        print(f"[stopping orphaned emulator {pid}]", file=sys.stderr)
+        subprocess.run(["taskkill", "/F", "/PID", pid],
+                       capture_output=True, text=True)
+    if pids:
+        time.sleep(1.0)
 
 
 def alive(pid):
@@ -137,7 +164,7 @@ class Shell:
 
     # ---- commands --------------------------------------------------------
 
-    def cmd(self, command, settle=2.0, max_wait=120.0):
+    def cmd(self, command, settle=2.0, max_wait=120.0, require_prompt=False):
         """Type a command, wait for the prompt to come back, return its output.
 
         Two quirks of the keyboard injection are worked around here. The first
@@ -160,11 +187,26 @@ class Shell:
                 # Back at the prompt and nothing changing: done.
                 if text.rstrip().endswith("*") and stable >= settle:
                     break
-                if stable >= max(settle * 3, 6.0):
+                # A command that says nothing looks exactly like one that
+                # has finished, so a caller that has redirected the output
+                # waits for the prompt and nothing else. Without that, any
+                # assembly taking more than six seconds was abandoned while
+                # it ran -- the log read half-written, the next unit staged
+                # on top of the files still in use, and every unit after it
+                # producing nothing at all.
+                if not require_prompt and stable >= max(settle * 3, 6.0):
                     break
             else:
                 stable = 0.0
                 last = text
+        # A caller that waits for the prompt is waiting for the command
+        # to finish, so not seeing one means it did not. Saying so lets
+        # the run restart the instance rather than carry on reading
+        # files that are still being written.
+        if require_prompt and not last.rstrip().endswith("*"):
+            raise TimeoutError(
+                f"no prompt after {max_wait:.0f}s: {command.split()[0]}"
+            )
         # Drop the echoed command line and the trailing prompt.
         out = last
         head, sep, rest = out.partition(chr(10))
