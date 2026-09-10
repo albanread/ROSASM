@@ -852,12 +852,62 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
+    /// The boundary a line has to start on.
+    ///
+    /// ObjAsm aligns automatically, and has to: an ARM instruction is a word
+    /// and the processor fetches it from one, and `DCD` allocates words
+    /// "aligned on four-byte boundaries", which is what `DCDU` exists to
+    /// opt out of. Only `DCB` packs into whatever byte comes next -- which is
+    /// why the sources put a string in the middle of a routine and carry
+    /// straight on into code with no `ALIGN` of their own.
+    fn alignment_of(line: &Line) -> u32 {
+        let Some(op) = line.opcode_str() else { return 1 };
+        match op.to_ascii_uppercase().as_str() {
+            // Bytes, and the directives that place none or place their own.
+            "DCB" | "=" | "ALIGN" | "SPACE" | "%" | "EXPORT" | "IMPORT" | "EXTERN"
+            | "GLOBAL" | "KEEP" | "ENTRY" | "DATA" | "ARM" | "CODE32" | "REQUIRE"
+            | "EXPORTAS" | "STRONG" | "RN" | "CN" | "FN" | "DN" | "SN" | "CP"
+            | "NOFP" | "OPT" | "TTL" | "SUBT" => 1,
+            "DCW" => 2,
+            _ => 4,
+        }
+    }
+
+    /// Move the location counter to a boundary, emitting the padding.
+    ///
+    /// The padding has to reach the object and not only the counter: the
+    /// driver lays each line's bytes down in order, so a gap the counter
+    /// knows about and the data does not puts everything after it two bytes
+    /// early and every branch past it out by two.
+    fn pad_to(&mut self, boundary: u32, line_num: usize) {
+        let Some(a) = self.area.as_ref() else { return };
+        let (from, to) = (a.offset, layout::align_to(a.offset, boundary.max(1), 0));
+        if to == from {
+            return;
+        }
+        if let Some(a) = self.area.as_mut() {
+            a.offset = to;
+        }
+        let area_index = self.current_area_index();
+        let rout = self.rout.clone();
+        let origin = self.origin(line_num);
+        self.out.push(ExpandedLine {
+            text: String::new(),
+            origin,
+            addr: from,
+            bytes: vec![0u8; (to - from) as usize],
+            listing_only: false,
+            area_index,
+            rout,
+            literal: None,
+        });
+        self.set_builtin_dot();
+    }
+
     /// Place the pending pool as a line of its own, for an `END` or the end of
     /// the input, where there is no `LTORG` to hang it on.
     fn emit_pool(&mut self, line_num: usize) -> R<()> {
-        if let Some(a) = self.area.as_mut() {
-            a.offset = layout::align_to(a.offset, 4, 0);
-        }
+        self.pad_to(4, line_num);
         let addr = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
         let area_index = self.current_area_index();
         let rout = self.rout.clone();
@@ -2900,6 +2950,8 @@ impl<'a> Expander<'a> {
             }
         }
         if relexed.kind == Kind::Statement {
+            // Before the address is read, because padding moves it.
+            self.pad_to(Self::alignment_of(&relexed), line.num);
             let mut addr = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
             // Before advancing, so the pool sees its literals in source order.
             let literal = self.note_literal(&relexed);
@@ -3997,5 +4049,86 @@ mod base_operator_tests {
         ])
         .expect_err("does not assemble");
         assert!(e.to_string().contains("BASE"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod automatic_alignment_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Every byte the object gets, in order, which is what alignment is
+    /// about: a gap the location counter knows about and the data does not
+    /// puts everything after it two bytes early.
+    fn bytes(src: &[&str]) -> Vec<u8> {
+        let r = MapResolver(HashMap::new());
+        let mut e = Expander::new(&r);
+        let out = e
+            .run("test", src.iter().map(|s| s.to_string()).collect())
+            .expect("assembles");
+        out.iter().flat_map(|l| l.bytes.clone()).collect()
+    }
+
+    fn addresses(src: &[&str]) -> Vec<(String, u32)> {
+        let r = MapResolver(HashMap::new());
+        let mut e = Expander::new(&r);
+        let out = e
+            .run("test", src.iter().map(|s| s.to_string()).collect())
+            .expect("assembles");
+        out.iter()
+            .filter(|l| !l.listing_only && !l.text.trim().is_empty())
+            .map(|l| (l.text.trim().to_string(), l.addr))
+            .collect()
+    }
+
+    /// DADebug puts `= "Debug start", 13, 10, 0` in the middle of a routine
+    /// and carries straight on into `CMP`, with no ALIGN. The instruction is
+    /// a word and is fetched from one.
+    #[test]
+    fn an_instruction_after_a_string_starts_on_a_word() {
+        let got = addresses(&[
+            "        AREA    x, CODE, READONLY",
+            "        =       \"abc\"",
+            "        CMP     r0, #1",
+            "        END",
+        ]);
+        assert_eq!(got.last().map(|(_, a)| *a), Some(4));
+    }
+
+    /// And the padding is in the object, not only in the counter.
+    #[test]
+    fn the_padding_is_emitted() {
+        let got = bytes(&[
+            "        AREA    x, CODE, READONLY",
+            "        =       \"abc\"",
+            "        DCD     &12345678",
+            "        END",
+        ]);
+        assert_eq!(got, vec![b'a', b'b', b'c', 0, 0x78, 0x56, 0x34, 0x12]);
+    }
+
+    /// `DCD` allocates words "aligned on four-byte boundaries"; `DCW` a
+    /// halfword; `DCB` takes whatever byte comes next.
+    #[test]
+    fn each_width_aligns_to_itself() {
+        let got = bytes(&[
+            "        AREA    x, DATA",
+            "        DCB     1",
+            "        DCW     &0203",
+            "        DCB     4",
+            "        END",
+        ]);
+        assert_eq!(got, vec![1, 0, 3, 2, 4]);
+    }
+
+    #[test]
+    fn a_string_may_still_run_on_unaligned() {
+        let got = bytes(&[
+            "        AREA    x, DATA",
+            "        DCB     \"ab\"",
+            "        DCB     \"c\"",
+            "        END",
+        ]);
+        assert_eq!(got, vec![b'a', b'b', b'c']);
     }
 }
