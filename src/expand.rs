@@ -967,7 +967,7 @@ impl<'a> Expander<'a> {
     /// -- which for a `VLDR` it cannot do at all, and which for an `ADR` we
     /// would rather do ourselves. A label elsewhere keeps its name and becomes
     /// a relocation directive.
-    fn resolve_name(&self, word: &str, line: &ExpandedLine) -> Option<String> {
+    fn resolve_name(&self, word: &str) -> Option<String> {
         // A label is not folded here. Where it stands for an address it is
         // one term of an expression -- `B SLVK + SWIRelocation` -- and
         // rewriting the term alone would leave the rest measured from
@@ -1191,7 +1191,7 @@ impl<'a> Expander<'a> {
                     // defines, and reaches the same treatment. Only a name
                     // this file does not define stays quoted, which is what
                     // lets the encoder accept the characters in it.
-                    match self.resolve_name(&name, line) {
+                    match self.resolve_name(&name) {
                         Some(text) => out.push_str(&text),
                         None => {
                             out.push('"');
@@ -1308,7 +1308,7 @@ impl<'a> Expander<'a> {
                         i += 1;
                     }
                     let word: String = cs[start..i].iter().collect();
-                    match self.resolve_name(&word, line) {
+                    match self.resolve_name(&word) {
                         Some(text) => out.push_str(&text),
                         None => out.push_str(&word),
                     }
