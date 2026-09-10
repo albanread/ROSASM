@@ -365,6 +365,16 @@ pub struct Expander<'a> {
     /// Symbols a `FIELD` defined under such a `MAP`, and the register they are
     /// relative to. `ADR Rd,Sym` on one of these is `ADD Rd,Rn,#offset`.
     field_bases: std::collections::HashMap<String, u32>,
+    /// Labels standing at the current address that have emitted nothing.
+    ///
+    /// A label with no bytes of its own belongs to whatever comes next, so
+    /// alignment inserted for the next instruction takes the label with it.
+    /// BBCEconet writes a table of bytes, then `OpenRx ROUT`, then code: the
+    /// branches to `OpenRx` are to the code, not to the last byte of the
+    /// table, and there is no ALIGN in between to say so.
+    fresh_labels: Vec<String>,
+    /// The same, for local labels, as indices into `locals`.
+    fresh_locals: Vec<usize>,
     /// Values waiting for the next `LTORG`.
     pending_literals: Vec<Literal>,
     /// Pools closed so far this pass, and the ones the previous pass closed.
@@ -621,6 +631,8 @@ impl<'a> Expander<'a> {
             cp_aliases: std::collections::HashMap::new(),
             map_base: None,
             field_bases: std::collections::HashMap::new(),
+            fresh_labels: Vec::new(),
+            fresh_locals: Vec::new(),
             pending_literals: Vec::new(),
             pools: Vec::new(),
             pools_prev: Vec::new(),
@@ -889,6 +901,16 @@ impl<'a> Expander<'a> {
             a.offset = to;
         }
         let area_index = self.current_area_index();
+        // A label with nothing of its own moves with the alignment.
+        for name in std::mem::take(&mut self.fresh_labels) {
+            self.syms.define_absolute(&name, to);
+            self.label_defs.insert(name, (area_index, to));
+        }
+        for i in std::mem::take(&mut self.fresh_locals) {
+            if let Some(l) = self.locals.get_mut(i) {
+                l.addr = to;
+            }
+        }
         let rout = self.rout.clone();
         let origin = self.origin(line_num);
         self.out.push(ExpandedLine {
@@ -1538,6 +1560,7 @@ impl<'a> Expander<'a> {
         // skipped the second time round.
         self.syms.set_variables(self.initial_vars.clone());
         self.pending_equs.clear();
+        self.settle_labels();
         // Pass two lays every area out again from the start.
         for sz in &mut self.area_sizes {
             *sz = 0;
@@ -2264,6 +2287,7 @@ impl<'a> Expander<'a> {
                     .syms
                     .set("{AREANAME}", Value::Str(name.clone()));
                 self.area = Some(layout::Area { name, attrs, offset });
+                self.settle_labels();
                 self.set_builtin_dot();
                 Ok(())
             }
@@ -2301,6 +2325,7 @@ impl<'a> Expander<'a> {
         };
         let up = op.to_ascii_uppercase();
         let operands = line.operands_str().unwrap_or("");
+        let before = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
 
         // The label is placed before the line's own bytes.
         self.define_label(line);
@@ -2341,6 +2366,9 @@ impl<'a> Expander<'a> {
         let Some(area) = self.area.as_mut() else { return };
         if let Some(n) = layout::data_size(&up, operands) {
             area.offset = area.offset.wrapping_add(n);
+            if n != 0 {
+                self.settle_labels();
+            }
             self.set_builtin_dot();
             return;
         }
@@ -2385,7 +2413,19 @@ impl<'a> Expander<'a> {
             // Anything else that reaches here is an ARM instruction.
             _ => area.offset = area.offset.wrapping_add(4),
         }
+        // Past this line's bytes, so any label on it is no longer waiting for
+        // something to belong to.
+        if self.area.as_ref().map(|a| a.offset) != Some(before) {
+            self.settle_labels();
+        }
         self.set_builtin_dot();
+    }
+
+    /// Bytes have been placed, so the labels standing over them are theirs
+    /// and no longer move.
+    fn settle_labels(&mut self) {
+        self.fresh_labels.clear();
+        self.fresh_locals.clear();
     }
 
     /// Evaluate the operands of a data directive where we can.
@@ -2660,13 +2700,15 @@ impl<'a> Expander<'a> {
                 let scope = routine.or_else(|| self.rout.clone()).unwrap_or_default();
                 let area = self.current_area_index();
                 self.locals.push(LocalDef { scope, number: n, addr, area });
+                self.fresh_locals.push(self.locals.len() - 1);
             }
             None => {
                 self.syms.define_absolute(&name, addr);
                 // The second pass overwrites the first pass's guess, which is
                 // what makes a forward reference come out right.
                 let area = self.current_area_index();
-                self.label_defs.insert(name, (area, addr));
+                self.label_defs.insert(name.clone(), (area, addr));
+                self.fresh_labels.push(name);
             }
         }
     }
@@ -4130,5 +4172,61 @@ mod automatic_alignment_tests {
             "        END",
         ]);
         assert_eq!(got, vec![b'a', b'b', b'c']);
+    }
+}
+
+#[cfg(test)]
+mod waiting_label_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn labels(src: &[&str]) -> std::collections::HashMap<String, (usize, u32)> {
+        let r = MapResolver(HashMap::new());
+        let mut e = Expander::new(&r);
+        e.run("test", src.iter().map(|s| s.to_string()).collect())
+            .expect("assembles");
+        e.label_defs().clone()
+    }
+
+    /// BBCEconet writes a table of thirteen bytes, then `OpenRx ROUT`, then
+    /// code, with no ALIGN in between. The branches to `OpenRx` are to the
+    /// code: a label with nothing of its own belongs to whatever comes next,
+    /// and goes wherever the alignment puts it.
+    #[test]
+    fn a_label_with_no_bytes_moves_with_the_alignment() {
+        let got = labels(&[
+            "        AREA    x, CODE, READONLY",
+            "        DCB     1, 2, 3",
+            "Here    ROUT",
+            "        MOV     r0, #0",
+            "        END",
+        ]);
+        assert_eq!(got.get("Here").map(|(_, a)| *a), Some(4));
+    }
+
+    /// A label with bytes of its own stays with them.
+    #[test]
+    fn a_label_on_a_data_line_keeps_its_address() {
+        let got = labels(&[
+            "        AREA    x, CODE, READONLY",
+            "        DCB     1",
+            "Here    DCB     2, 3",
+            "        MOV     r0, #0",
+            "        END",
+        ]);
+        assert_eq!(got.get("Here").map(|(_, a)| *a), Some(1));
+    }
+
+    /// And one that needs no alignment does not move.
+    #[test]
+    fn a_label_before_aligned_code_stays_put() {
+        let got = labels(&[
+            "        AREA    x, CODE, READONLY",
+            "        DCB     1, 2, 3, 4",
+            "Here",
+            "        MOV     r0, #0",
+            "        END",
+        ]);
+        assert_eq!(got.get("Here").map(|(_, a)| *a), Some(4));
     }
 }
