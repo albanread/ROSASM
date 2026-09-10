@@ -99,10 +99,22 @@ def units(root):
                 text = open(path, "rb").read().decode("latin-1")
             except OSError:
                 continue
-            # A GET target counts whichever way round the RISC OS path is
-            # written: `GET s.Foo` and `GET Foo.s` both name Foo.
-            for tgt in re.findall(r"^[ 	]+(?:GET|INCLUDE)[ 	]+(\S+)", text, re.M):
-                for part in tgt.split(":")[-1].split("."):
+            # A GET target counts whichever way round the path is written:
+            # `GET s.Foo` and `GET Foo.s` both name Foo. `LNK` counts too --
+            # it is a GET that does not come back, and it is how every one
+            # of the C library's stubs pulls in the file that does the work.
+            #
+            # A target ending `.s` is a host-style path, so its leafname is
+            # the stem after the last separator: `LNK clib/cl_stub2.s` names
+            # cl_stub2. Anything else is read the RISC OS way, where `.` is
+            # the separator and `GET ./barrier.hdr` names a header beside
+            # `s.barrier` rather than the unit itself.
+            for tgt in re.findall(r"^[ 	]+(?:GET|INCLUDE|LNK)[ 	]+(\S+)", text, re.M):
+                tgt = tgt.split(":")[-1]
+                if tgt.lower().endswith(".s"):
+                    included.add(re.split(r"[/\\]", tgt[:-2])[-1].lower())
+                    continue
+                for part in tgt.split("."):
                     if part and part != "s":
                         included.add(part.lower())
             if os.path.basename(dp) == "s" and re.search(r"^[ 	]+AREA[ 	]", text, re.M):

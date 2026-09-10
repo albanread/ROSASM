@@ -112,6 +112,7 @@ def assemble(unit):
         "bytes": int(m.group(1)) if m else 0,
         "areas": int(m.group(2)) if m else 0,
         "object": size,
+        "err": err,
         "unsupported": [m.group(1) for m in UNSUPPORTED.finditer(err)],
         "relocs": [m.group(1) for m in UNHANDLED_RELOC.finditer(err)],
     }
@@ -131,6 +132,11 @@ def main():
     ap.add_argument("--limit", type=int)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--out")
+    ap.add_argument(
+        "--only",
+        help="assemble only units whose path contains this, and print what "
+        "each one said in full",
+    )
     a = ap.parse_args()
 
     # The emulator's disc is not involved here, so the export tree goes
@@ -154,6 +160,11 @@ def main():
     # `Hdr:HALSize.<HALSize>` cannot be found without knowing HALSize is 64K.
     PD[:] = [f'{k} SETS "{v}"' for k, v in sorted(variables.items())]
     us = units(a.root)
+    if a.only:
+        needle = a.only.replace("\\", "/").lower()
+        us = [u for u in us if needle in u.replace("\\", "/").lower()]
+        if not us:
+            raise SystemExit(f"no unit matches {a.only!r}")
     if a.limit:
         us = us[: a.limit]
     print(f"{len(us)} units, {a.jobs} jobs", flush=True)
@@ -165,6 +176,15 @@ def main():
             results.append(f.result())
             if n % 25 == 0:
                 print(f"  {n}/{len(us)}", flush=True)
+
+    if a.only:
+        # One unit at a time is for reading, so nothing is grouped away.
+        for r in sorted(results, key=lambda r: r["unit"]):
+            print(f"=== {os.path.relpath(r['unit'], a.root)}")
+            print("    " + ("assembled" if r["ok"] else "FAILED"))
+            for line in (r.get("err") or "").strip().splitlines():
+                print(f"    {line}")
+        return 0 if all(r["ok"] for r in results) else 1
 
     ok = [r for r in results if r["ok"]]
     lines = []
