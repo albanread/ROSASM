@@ -32,7 +32,9 @@ from component_flags import (  # noqa: E402
 )
 from export_hdrs import components, export_hdrs  # noqa: E402
 
-ROSASM = r"F:\RISCOSDEV\rosasm\target\release\rosasm.exe"
+# Overridable so a sweep can run against a build other than the one in
+# `target/release`, which the emulator harness may be executing.
+ROSASM = os.environ.get("ROSASM", r"F:\RISCOSDEV\rosasm\target\release\rosasm.exe")
 AOFDUMP = ROSASM.replace("rosasm.exe", "aofdump.exe")
 # Filled from the build's own environment file once the export tree is built.
 PD = []

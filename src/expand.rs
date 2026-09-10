@@ -756,7 +756,7 @@ impl<'a> Expander<'a> {
         let name = name.to_string();
         self.syms.declare_global(&name, ty);
         let rhs = line.operands_str().unwrap_or("").to_string();
-        let v = match expr::eval(&rhs, &self.syms) {
+        let v = match self.eval_expr(&rhs) {
             Ok(v) => v,
             Err(e) => return self.err(0, format!("in predefine '{text}': {e}")),
         };
@@ -975,7 +975,7 @@ impl<'a> Expander<'a> {
     /// only thing that would make sense. Elsewhere `"a" = "b"` is a string
     /// comparison and must stay one.
     fn eval_immediate(&self, text: &str) -> Option<u32> {
-        match expr::eval(text, &self.syms) {
+        match self.eval_expr(text) {
             Ok(Value::Arith(n)) => Some(n),
             Ok(Value::Str(s)) if s.chars().count() == 1 => Some(s.chars().next()? as u32),
             _ => None,
@@ -1015,6 +1015,74 @@ impl<'a> Expander<'a> {
             return Some(format!("{kind}{n}"));
         }
         None
+    }
+
+    /// `:BASE: sym` — the register a storage map based its symbols on.
+    ///
+    /// The manual defines the operator over a register-relative expression,
+    /// and `:INDEX:` over the same thing as the offset from that register.
+    /// The evaluator works in numbers, so by the time it holds a value the
+    /// register is gone; `:INDEX:` is already right because the value *is*
+    /// the offset, and `:BASE:` is resolved here instead, from the map that
+    /// defined the symbol.
+    ///
+    /// The corpus applies it to one symbol at a time, fifty-three times,
+    /// nearly always as `ASSERT (:BASE:CurrentContext) = Rwp` guarding a
+    /// workspace layout against the register the code actually uses. A name
+    /// that came from no based map is left alone, so the evaluator still
+    /// reports it as the error the manual says it is.
+    fn substitute_bases(&self, text: &str) -> String {
+        if !text.to_ascii_uppercase().contains(":BASE:") {
+            return text.to_string();
+        }
+        let cs: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < cs.len() {
+            let rest: String = cs[i..].iter().take(6).collect();
+            if !rest.eq_ignore_ascii_case(":BASE:") {
+                out.push(cs[i]);
+                i += 1;
+                continue;
+            }
+            let mut j = i + 6;
+            while j < cs.len() && cs[j].is_whitespace() {
+                j += 1;
+            }
+            let start = j;
+            if cs.get(j) == Some(&'|') {
+                j += 1;
+                while j < cs.len() && cs[j] != '|' {
+                    j += 1;
+                }
+                j = (j + 1).min(cs.len());
+            } else {
+                while j < cs.len() && (cs[j].is_alphanumeric() || "_$".contains(cs[j])) {
+                    j += 1;
+                }
+            }
+            let name = strip_bars(&cs[start..j].iter().collect::<String>());
+            match self.field_bases.get(&name) {
+                Some(base) => {
+                    out.push_str(&base.to_string());
+                    i = j;
+                }
+                None => {
+                    out.push(cs[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Evaluate an expression the way this assembler's sources write them.
+    ///
+    /// Everything the evaluator cannot know on its own is settled first. At
+    /// present that is `:BASE:`; the rest of the expression language is the
+    /// evaluator's own.
+    fn eval_expr(&self, text: &str) -> Result<Value, expr::EvalError> {
+        expr::eval(&self.substitute_bases(text), &self.syms)
     }
 
     /// Replace every local label reference in an expression with its address.
@@ -1131,7 +1199,7 @@ impl<'a> Expander<'a> {
         }
         let text = self.substitute_locals(t, line.addr, line.area_index, line.rout.as_deref());
         let text = Self::substitute_dot(&text, line.addr);
-        match expr::eval(&text, &self.syms) {
+        match self.eval_expr(&text) {
             Ok(Value::Arith(v)) => {
                 let d = v as i64 - line.addr as i64;
                 Some(if d < 0 {
@@ -1173,7 +1241,7 @@ impl<'a> Expander<'a> {
         }
         let text = self.substitute_locals(t, line.addr, line.area_index, line.rout.as_deref());
         let text = Self::substitute_dot(&text, line.addr);
-        match expr::eval(&text, &self.syms) {
+        match self.eval_expr(&text) {
             Ok(Value::Arith(v)) => Some(format!("[r{base}, #{}]", v as i32)),
             _ => None,
         }
@@ -1493,7 +1561,7 @@ impl<'a> Expander<'a> {
     }
 
     fn eval_logical(&self, src: &str, line: usize) -> R<bool> {
-        match expr::eval(src, &self.syms) {
+        match self.eval_expr(src) {
             Ok(Value::Logical(b)) => Ok(b),
             Ok(v) => self.err(line, format!("expected a logical value, got {v:?}")),
             Err(e) => self.err(line, e.to_string()),
@@ -1696,7 +1764,7 @@ impl<'a> Expander<'a> {
         };
         let name = self.expand_text(name);
         let rhs = self.expand_text(line.operands_str().unwrap_or(""));
-        let v = match expr::eval(&rhs, &self.syms) {
+        let v = match self.eval_expr(&rhs) {
             Ok(v) => v,
             Err(e) => return self.err(line.num, e.to_string()),
         };
@@ -1813,7 +1881,7 @@ impl<'a> Expander<'a> {
         };
         let name = strip_bars(&self.expand_text(name));
         let rhs = self.expand_text(line.operands_str().unwrap_or(""));
-        match expr::eval(&rhs, &self.syms) {
+        match self.eval_expr(&rhs) {
             Ok(Value::Arith(v)) => {
                 self.syms.define_absolute(&name, v);
                 Ok(())
@@ -1915,7 +1983,7 @@ impl<'a> Expander<'a> {
         loop {
             let before = self.pending_equs.len();
             for (name, rhs, num) in std::mem::take(&mut self.pending_equs) {
-                match expr::eval(&rhs, &self.syms) {
+                match self.eval_expr(&rhs) {
                     Ok(Value::Arith(v)) => self.syms.define_absolute(&name, v),
                     Ok(v) => {
                         let ty = match &v {
@@ -1947,7 +2015,7 @@ impl<'a> Expander<'a> {
         let v = if base.is_empty() {
             0
         } else {
-            match expr::eval(&base, &self.syms) {
+            match self.eval_expr(&base) {
                 Ok(Value::Arith(n)) => n,
                 Ok(_) => return self.err(line.num, "MAP needs an arithmetic origin"),
                 Err(e) => return self.err(line.num, e.to_string()),
@@ -1977,7 +2045,7 @@ impl<'a> Expander<'a> {
     /// `«sym» # expr` — give the symbol the current `@`, then advance it.
     fn do_field(&mut self, line: &Line) -> R<()> {
         let operands = self.expand_text(line.operands_str().unwrap_or(""));
-        let size = match expr::eval(&operands, &self.syms) {
+        let size = match self.eval_expr(&operands) {
             Ok(Value::Arith(n)) => n,
             Ok(_) => return self.err(line.num, "FIELD needs an arithmetic size"),
             Err(e) => return self.err(line.num, e.to_string()),
@@ -2018,7 +2086,7 @@ impl<'a> Expander<'a> {
         };
         let name = strip_bars(&self.expand_text(label));
         let rhs = self.expand_text(line.operands_str().unwrap_or(""));
-        match expr::eval(&rhs, &self.syms) {
+        match self.eval_expr(&rhs) {
             Ok(Value::Arith(n)) => {
                 self.syms.define_absolute(&name, n);
                 // Only `RN`: a coprocessor or floating-point register number
@@ -2213,6 +2281,13 @@ impl<'a> Expander<'a> {
         // holds it mutably.
         let fpa_words = crate::fpa::words(&up);
 
+        // `SPACE`'s operand is the only one read here, and reading it borrows
+        // the symbol table, so it happens before the area is taken -- and
+        // only for `SPACE`, since every instruction in the corpus comes
+        // through here and evaluating its operands would be work for nothing.
+        let size = matches!(up.as_str(), "SPACE" | "%")
+            .then(|| self.eval_expr(operands))
+            .transpose();
         let Some(area) = self.area.as_mut() else { return };
         if let Some(n) = layout::data_size(&up, operands) {
             area.offset = area.offset.wrapping_add(n);
@@ -2233,7 +2308,9 @@ impl<'a> Expander<'a> {
                 area.offset = layout::align_to(area.offset, boundary.max(1), plus);
             }
             "SPACE" | "%" => {
-                if let Ok(Value::Arith(n)) = expr::eval(operands, &self.syms) {
+                // Evaluated before the area is taken mutably, since reading
+                // the expression reads the symbol table.
+                if let Ok(Some(Value::Arith(n))) = size {
                     area.offset = area.offset.wrapping_add(n);
                 }
             }
@@ -2320,7 +2397,7 @@ impl<'a> Expander<'a> {
                 }
                 continue;
             }
-            let v = match expr::eval(t, &self.syms) {
+            let v = match self.eval_expr(t) {
                 Ok(Value::Arith(n)) => {
                     if !identifiers(t).is_empty() {
                         holes.push((out.len() as u32, width as u8, t.to_string(), true));
@@ -2396,7 +2473,7 @@ impl<'a> Expander<'a> {
             };
         }
 
-        let value = match expr::eval(&expr, &self.syms) {
+        let value = match self.eval_expr(&expr) {
             Ok(Value::Arith(n)) => Some(n),
             _ => None,
         };
@@ -2473,7 +2550,7 @@ impl<'a> Expander<'a> {
                     ),
                 );
             }
-            let v = match expr::eval(&l.expr, &self.syms) {
+            let v = match self.eval_expr(&l.expr) {
                 Ok(Value::Arith(n)) => n,
                 // Not an error: an imported symbol has no value here, and the
                 // relocation below is what supplies it.
@@ -2561,7 +2638,7 @@ impl<'a> Expander<'a> {
         let area = self.current_area_index();
         let rout = self.rout.clone();
         let src = self.substitute_locals(&src, here, area, rout.as_deref());
-        match expr::eval(&src, &self.syms) {
+        match self.eval_expr(&src) {
             Ok(Value::Logical(true)) => Ok(()),
             Ok(Value::Logical(false)) => {
                 let why = self.explain_comparison(&src);
@@ -2596,14 +2673,14 @@ impl<'a> Expander<'a> {
         let value = |i: usize| -> u32 {
             parts
                 .get(i)
-                .map(|t| match expr::eval(t.trim(), &self.syms) {
+                .map(|t| match self.eval_expr(t.trim()) {
                     Ok(Value::Arith(n)) => n,
                     Ok(Value::Logical(b)) => b as u32,
                     _ => 0,
                 })
                 .unwrap_or(0)
         };
-        let message = match parts.get(1).map(|t| expr::eval(t.trim(), &self.syms)) {
+        let message = match parts.get(1).map(|t| self.eval_expr(t.trim())) {
             Some(Ok(Value::Str(m))) => m,
             // A message that will not evaluate is still worth showing.
             _ => parts.get(1).map(|t| t.trim().to_string()).unwrap_or_default(),
@@ -2636,7 +2713,7 @@ impl<'a> Expander<'a> {
                 '=' if depth == 0 && !matches!(cs.get(i.wrapping_sub(1)), Some('<' | '>' | '/')) => {
                     let (a, b) = (&src[..i], &src[i + 1..]);
                     if let (Ok(Value::Arith(x)), Ok(Value::Arith(y))) =
-                        (expr::eval(a, &self.syms), expr::eval(b, &self.syms))
+                        (self.eval_expr(a), self.eval_expr(b))
                     {
                         let d = y as i64 - x as i64;
                         return format!(" ({x} against {y}, {d:+} out)");
@@ -3864,5 +3941,61 @@ mod macro_conditional_tests {
         let text = e.to_string();
         assert!(text.contains("test:2"), "{text}");
         assert!(text.contains("never closed"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod base_operator_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn run(src: &[&str]) -> R<Vec<ExpandedLine>> {
+        let r = MapResolver(HashMap::new());
+        let mut e = Expander::new(&r);
+        e.run("test", src.iter().map(|s| s.to_string()).collect())
+    }
+
+    const MAP: [&str; 5] = [
+        "        AREA    x, CODE, READONLY",
+        "wp      RN      12",
+        "        ^       0, wp",
+        "Mutex   #       4",
+        "Saved   #       4",
+    ];
+
+    fn with(tail: &[&str]) -> R<Vec<ExpandedLine>> {
+        let mut v: Vec<&str> = MAP.to_vec();
+        v.extend_from_slice(tail);
+        v.push("        END");
+        run(&v)
+    }
+
+    /// `ASSERT (:BASE:CurrentContext) = Rwp` guards a workspace layout
+    /// against the register the code around it actually uses, fifty-three
+    /// times over in the corpus.
+    #[test]
+    fn base_is_the_register_the_map_was_based_on() {
+        with(&["        ASSERT  :BASE:Mutex = wp"]).expect("assembles");
+        with(&["        ASSERT  (:BASE:Saved) = 12"]).expect("assembles");
+    }
+
+    /// The offset within the map, which is the value the symbol already has.
+    #[test]
+    fn index_is_the_offset_from_that_register() {
+        with(&["        ASSERT  :INDEX: Saved = 4"]).expect("assembles");
+    }
+
+    /// The manual: with no register offsets, "BASE produces an error". A name
+    /// from no based map is left for the evaluator to say so.
+    #[test]
+    fn base_on_an_ordinary_symbol_is_still_an_error() {
+        let e = run(&[
+            "        AREA    x, CODE, READONLY",
+            "Plain   *       4",
+            "        ASSERT  :BASE:Plain = 0",
+            "        END",
+        ])
+        .expect_err("does not assemble");
+        assert!(e.to_string().contains("BASE"), "{e}");
     }
 }
