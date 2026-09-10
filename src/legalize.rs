@@ -44,6 +44,9 @@ pub struct Context {
     pub here: u32,
     /// What an `ADR`/`ADRL` is aiming at, when it is known.
     pub target: Option<AdrTarget>,
+    /// Whether the target is a symbol the linker has to supply, which
+    /// changes how ObjAsm splits the offset between the two instructions.
+    pub relocated: bool,
 }
 
 /// The three kinds of expression `ADR` accepts, from the manual: "The
@@ -87,18 +90,24 @@ pub fn as_arm_immediate(v: u32) -> Option<(u32, u32)> {
 /// Each part is the eight-bit field at some even rotation. Returns `None` if
 /// more parts would be needed than allowed.
 ///
-/// Which end it starts from is not a matter of taste. BCMSupport's device
-/// veneers are nine `ADRL`s at an imported symbol, and ObjAsm writes the
-/// first as `SUB ip, pc, #&20` / `SUB ip, ip, #&C` -- the field holding the
-/// highest set bit, then the remainder -- where working up from the low end
-/// gives `#&2C` and `#0`. Both reach the same address; only one is the same
-/// object file.
+/// Which end it starts from is not a matter of taste, and it is not the same
+/// end in both cases. For an offset ObjAsm can work out, the low field goes
+/// first: FilterMgr's `ADRL r1, <label>` at a distance of &11A is `SUB r1,
+/// pc, #&1A` / `SUB r1, r1, #&100`. For one it cannot -- an imported symbol,
+/// where the instructions are a placeholder the linker will rewrite -- the
+/// high field goes first: BCMSupport's nine device veneers are `SUB ip, pc,
+/// #&20` / `SUB ip, ip, #&C` for a distance of &2C, which from the low end
+/// would be `#&2C` and `#0`. Fourteen examples, and they do not agree with
+/// each other.
 ///
-/// A value whose bits are spread too widely for that leaves a remainder no
-/// single field can hold, and there the low end is tried instead. Nothing in
-/// the corpus says what ObjAsm does with one, and refusing an `ADRL` that
-/// used to assemble would be the worse guess.
+/// Either way, a value whose bits are spread too widely for the chosen end
+/// leaves a remainder no single field can hold, and the other end is tried.
 pub fn split_immediates(v: u32, max_parts: usize) -> Option<Vec<u32>> {
+    split_from_bottom(v, max_parts).or_else(|| split_from_top(v, max_parts))
+}
+
+/// The same, for an offset the linker will supply.
+pub fn split_immediates_relocated(v: u32, max_parts: usize) -> Option<Vec<u32>> {
     split_from_top(v, max_parts).or_else(|| split_from_bottom(v, max_parts))
 }
 
@@ -155,7 +164,7 @@ fn split_from_bottom(mut v: u32, max_parts: usize) -> Option<Vec<u32>> {
 /// `pc` reads as the instruction's own address plus eight, so the offset is
 /// measured from there. A negative offset becomes `SUB`.
 pub fn expand_adrl(cond: &str, rd: &str, here: u32, target: u32) -> Legalized {
-    add_or_sub(cond, rd, "pc", target as i64 - (here as i64 + 8), 2)
+    add_or_sub(cond, rd, "pc", target as i64 - (here as i64 + 8), 2, false)
 }
 
 /// `Rd := base ± magnitude`, in exactly `count` instructions.
@@ -165,13 +174,25 @@ pub fn expand_adrl(cond: &str, rd: &str, here: u32, target: u32) -> Legalized {
 /// from the destination. Exactly `count` instructions come out even when fewer
 /// would do, because the location counter was advanced on that basis and a
 /// short expansion would move every label after it.
-fn add_or_sub(cond: &str, rd: &str, base: &str, delta: i64, count: usize) -> Legalized {
+fn add_or_sub(
+    cond: &str,
+    rd: &str,
+    base: &str,
+    delta: i64,
+    count: usize,
+    relocated: bool,
+) -> Legalized {
     let (op, mag) = if delta >= 0 {
         ("ADD", delta as u32)
     } else {
         ("SUB", (-delta) as u32)
     };
-    let Some(parts) = split_immediates(mag, count) else {
+    let split = if relocated {
+        split_immediates_relocated
+    } else {
+        split_immediates
+    };
+    let Some(parts) = split(mag, count) else {
         return Legalized::Unsupported(if count == 1 {
             format!("offset {delta} does not fit one instruction; ADRL reaches further")
         } else {
@@ -202,7 +223,7 @@ fn add_or_sub(cond: &str, rd: &str, base: &str, delta: i64, count: usize) -> Leg
 /// Unlike `ADRL` this is one instruction, so the offset has to fit in a single
 /// rotated immediate; if it does not, the source wanted `ADRL`.
 pub fn expand_adr(cond: &str, rd: &str, here: u32, target: u32) -> Legalized {
-    add_or_sub(cond, rd, "pc", target as i64 - (here as i64 + 8), 1)
+    add_or_sub(cond, rd, "pc", target as i64 - (here as i64 + 8), 1, false)
 }
 
 /// A literal already reduced to a number by the expression evaluator.
@@ -229,13 +250,20 @@ pub fn legalize(mnemonic: &str, operands: &str, ctx: &Context) -> Legalized {
         };
         return match target {
             AdrTarget::Program(t) => {
-                match add_or_sub(&cond, &rd, "pc", t as i64 - (ctx.here as i64 + 8), count) {
+                match add_or_sub(
+                    &cond,
+                    &rd,
+                    "pc",
+                    t as i64 - (ctx.here as i64 + 8),
+                    count,
+                    ctx.relocated,
+                ) {
                     Legalized::Unsupported(why) => Legalized::Unsupported(format!("{up} {why}")),
                     other => other,
                 }
             }
             AdrTarget::Register { base, offset } => {
-                match add_or_sub(&cond, &rd, &format!("r{base}"), offset as i64, count) {
+                match add_or_sub(&cond, &rd, &format!("r{base}"), offset as i64, count, false) {
                     Legalized::Unsupported(why) => Legalized::Unsupported(format!("{up} {why}")),
                     other => other,
                 }
@@ -451,7 +479,7 @@ mod tests {
 
     #[test]
     fn an_adr_with_no_known_target_is_reported() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         assert!(matches!(
             legalize("ADR", "r0, Somewhere", &ctx),
             Legalized::Unsupported(_)
@@ -460,14 +488,14 @@ mod tests {
 
     #[test]
     fn an_adrl_with_no_known_target_is_reported() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         let l = legalize("ADRL", "r0, Somewhere", &ctx);
         assert!(matches!(l, Legalized::Unsupported(_)));
     }
 
     #[test]
     fn an_ldr_of_a_small_literal_becomes_a_move() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         assert_eq!(
             legalize("LDR", "r0, =0x10", &ctx),
             Legalized::One("MOV".into(), "r0, #16".into())
@@ -481,7 +509,7 @@ mod tests {
 
     #[test]
     fn an_ldr_of_a_complemented_literal_becomes_mvn() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         // -1 is not an immediate; its complement, 0, is.
         assert_eq!(
             legalize("LDR", "r0, =0xFFFFFFFF", &ctx),
@@ -491,7 +519,7 @@ mod tests {
 
     #[test]
     fn an_ldr_needing_a_pool_says_so() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         match legalize("LDR", "r0, =0x12345678", &ctx) {
             Legalized::Unsupported(why) => assert!(why.contains("literal pool"), "{why}"),
             other => panic!("expected a refusal, got {other:?}"),
@@ -501,7 +529,7 @@ mod tests {
     #[test]
     fn a_numeric_adr_moves_rather_than_adds() {
         // "Numeric: MOV|MVN register,#constant will be produced."
-        let ctx = |v| Context { here: 0, target: Some(AdrTarget::Numeric(v)) };
+        let ctx = |v| Context { here: 0, target: Some(AdrTarget::Numeric(v)), relocated: false };
         assert_eq!(
             legalize("ADR", "r5, 44", &ctx(44)),
             Legalized::One("MOV".into(), "r5, #44".into())
@@ -521,7 +549,7 @@ mod tests {
     #[test]
     fn a_numeric_adrl_builds_the_word_in_two_halves() {
         // MOV32, which is MOVW then MOVT, and always two instructions.
-        let ctx = Context { here: 0, target: Some(AdrTarget::Numeric(0x1234_5678)) };
+        let ctx = Context { here: 0, target: Some(AdrTarget::Numeric(0x1234_5678)), relocated: false };
         let Legalized::Many(v) = legalize("ADRL", "r6, x", &ctx) else {
             panic!("expected two instructions")
         };
@@ -535,6 +563,7 @@ mod tests {
         let ctx = Context {
             here: 0,
             target: Some(AdrTarget::Register { base: 9, offset: 4 }),
+            relocated: false,
         };
         assert_eq!(
             legalize("ADR", "r4, Slot", &ctx),
@@ -549,6 +578,7 @@ mod tests {
         let ctx = Context {
             here: 0,
             target: Some(AdrTarget::Register { base: 12, offset: -8 }),
+            relocated: false,
         };
         assert_eq!(
             legalize("ADR", "r1, area1", &ctx),
@@ -560,22 +590,36 @@ mod tests {
     fn the_pre_ual_adrl_spelling_gets_two_instructions_and_its_condition() {
         // `ADREQL` is ADRL conditional on EQ, and must not be read as ADR --
         // that would be one instruction where the layout counted two.
-        let ctx = Context { here: 8, target: Some(AdrTarget::Program(44)) };
+        let ctx = Context { here: 8, target: Some(AdrTarget::Program(44)), relocated: false };
         let Legalized::Many(v) = legalize("ADREQL", "r2, Msg", &ctx) else {
             panic!("expected two instructions")
         };
         assert_eq!(v.len(), 2);
         assert!(v.iter().all(|(m, _)| m == "ADDEQ"), "{v:?}");
-        // `pc` reads eight past the first, so the pair adds up to 28 -- and
-        // the first takes the field holding the highest set bit, as ObjAsm
-        // writes it.
-        assert_eq!(v[0].1, "r2, pc, #16");
-        assert_eq!(v[1].1, "r2, r2, #12");
+        // `pc` reads eight past the first, and an offset ObjAsm can work out
+        // is split from the low end -- here it fits one field, so the second
+        // instruction adds nothing.
+        assert_eq!(v[0].1, "r2, pc, #28");
+        assert_eq!(v[1].1, "r2, r2, #0");
+    }
+
+    #[test]
+    fn a_relocated_adrl_is_split_from_the_other_end() {
+        // BCMSupport's device veneers reach an imported symbol, where the
+        // pair is a placeholder the linker rewrites, and ObjAsm writes the
+        // field holding the highest set bit first: `SUB ip, pc, #&20` /
+        // `SUB ip, ip, #&C` for a distance of &2C.
+        let ctx = Context { here: 0x24, target: Some(AdrTarget::Program(0)), relocated: true };
+        let Legalized::Many(v) = legalize("ADRL", "ip, Imported", &ctx) else {
+            panic!("expected two instructions")
+        };
+        assert_eq!(v[0].1, "ip, pc, #32");
+        assert_eq!(v[1].1, "ip, ip, #12");
     }
 
     #[test]
     fn the_26_bit_psr_forms_are_unsupported() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         for m in ["TEQP", "TSTP", "CMPP", "CMNP"] {
             match legalize(m, "r0, #1", &ctx) {
                 Legalized::Unsupported(why) => assert!(why.contains("26-bit"), "{why}"),
@@ -586,7 +630,7 @@ mod tests {
 
     #[test]
     fn an_fpa_instruction_is_translated_here() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         assert_eq!(
             legalize("ADFD", "f0, f1, f2", &ctx),
             Legalized::One("VADD.F64".into(), "d0, d1, d2".into())
@@ -600,7 +644,7 @@ mod tests {
 
     #[test]
     fn a_braceless_register_list_gets_its_braces() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         assert_eq!(
             legalize("VPUSH", "d8", &ctx),
             Legalized::One("VPUSH".into(), "{d8}".into())
@@ -614,7 +658,7 @@ mod tests {
 
     #[test]
     fn swp_is_reported_as_deprecated() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         assert!(matches!(
             legalize("SWP", "r0, r1, [r2]", &ctx),
             Legalized::Unsupported(_)
@@ -623,7 +667,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_instruction_passes_through_normalised() {
-        let ctx = Context { here: 0, target: None };
+        let ctx = Context { here: 0, target: None, relocated: false };
         assert_eq!(
             legalize("SUBNES", "r1, r1, #1", &ctx),
             Legalized::One("SUBSNE".into(), "r1, r1, #1".into())

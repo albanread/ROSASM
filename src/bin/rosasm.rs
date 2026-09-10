@@ -187,7 +187,8 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>, Vec<Adr
         // expansion, or nothing the encoder will accept.
         // An `ADR` at an imported symbol carries a relocation of its own:
         // the encoder is handed arithmetic on `pc` and has nothing to record.
-        if let Some(name) = adr_external(op, &operands, ex) {
+        let external = adr_external(op, &operands, ex);
+        if let Some(name) = external.clone() {
             adr_relocs.push(AdrReloc {
                 line: i,
                 name,
@@ -197,6 +198,7 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>, Vec<Adr
         let ctx = legalize::Context {
             here: l.addr,
             target: adr_target(op, &operands, l, ex),
+            relocated: external.is_some(),
         };
         match legalize::legalize(op, &operands, &ctx) {
             Legalized::One(m, o) => s.push_str(&format!("        {m} {o}\n")),
