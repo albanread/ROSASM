@@ -1,6 +1,7 @@
 //! `rosasm` — assemble ObjAsm source to an AOF object.
 //!
 //!     rosasm <source> -o <object> [-I dir]... [-PD "Sym SETA 1"]...
+//!                      [--map <file>] [--keep-temps]
 //!
 //! The pipeline: expand the macro language, lower each instruction to UAL,
 //! hand that to LLVM's integrated assembler for encoding, then translate the
@@ -334,6 +335,8 @@ fn main() {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut pds: Vec<String> = Vec::new();
     let mut keep = false;
+    let mut map: Option<PathBuf> = None;
+    let mut warn_assertions = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -354,12 +357,22 @@ fn main() {
                 }
             }
             "--keep-temps" => keep = true,
+            // The sources assert their own layout, so a failure is a defect
+            // and stops the build. Investigating one needs the opposite.
+            "--warn-assertions" => warn_assertions = true,
+            "--map" => {
+                i += 1;
+                map = args.get(i).map(PathBuf::from);
+            }
             s => source = Some(PathBuf::from(s)),
         }
         i += 1;
     }
     let (Some(source), Some(out)) = (source, out) else {
-        eprintln!("usage: rosasm <source> -o <object> [-I dir]... [-PD assignment]...");
+        eprintln!(
+            "usage: rosasm <source> -o <object> [-I dir]... [-PD assignment]... \
+             [--map file] [--warn-assertions] [--keep-temps]"
+        );
         std::process::exit(2);
     };
 
@@ -393,6 +406,7 @@ fn main() {
 
     let mut ex = Expander::new(&resolver);
     ex.set_target_builtins();
+    ex.set_assert_warnings(warn_assertions);
     for pd in &pds {
         if let Err(e) = ex.predefine(pd) {
             eprintln!("rosasm: bad -PD {pd:?}: {e}");
@@ -407,6 +421,30 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Where every line ended up. Enough to find a layout disagreement
+    // against ObjAsm's listing without needing a listing of our own, which is
+    // how the Kernel's `ASSERT {PC}-SVCDespatcher = SWIDespatch_Size` gets
+    // tracked down: the first address that differs is the line that did it.
+    if let Some(path) = &map {
+        let mut out = String::from("; address  area  file:line  source\n");
+        for l in &lines {
+            if l.listing_only {
+                continue;
+            }
+            out.push_str(&format!(
+                "{:08X} {:>3}  {}:{}  {}\n",
+                l.addr,
+                l.area_index,
+                l.origin.file,
+                l.origin.line,
+                l.text.trim_end()
+            ));
+        }
+        if let Err(e) = std::fs::write(path, out) {
+            eprintln!("rosasm: {}: {e}", path.display());
+        }
+    }
 
     // Encode the instructions.
     let (ual, index) = to_ual(&lines, &ex);

@@ -325,6 +325,13 @@ pub struct Expander<'a> {
     imports: Vec<String>,
     /// Data fields left for the linker, gathered once the values are final.
     data_fixups: Vec<DataFixup>,
+    /// Report a failed `ASSERT` and carry on, rather than stopping.
+    ///
+    /// The sources assert their own layout, so a failure is a real defect and
+    /// the assembler treats it as one. A listing is different: the whole point
+    /// of producing one is to find where the layout went wrong, and stopping
+    /// at the first assertion throws away the evidence.
+    assert_warnings: bool,
     /// Register names declared with `RN`. These are kept apart from the symbol
     /// table because `a1 RN 0` and `Flag EQU 0` are the same value with quite
     /// different meanings in an operand.
@@ -354,8 +361,12 @@ pub struct Expander<'a> {
     /// could do the job. Carried between passes so both lay out the same
     /// bytes, even where pass two could have evaluated something pass one
     /// could not.
-    literal_sites: Vec<Option<(usize, u32)>>,
-    literal_sites_prev: Vec<Option<(usize, u32)>>,
+    literal_sites: Vec<Option<LiteralRef>>,
+    literal_sites_prev: Vec<Option<LiteralRef>>,
+    /// Words in pools already placed: area, offset, and the text that made
+    /// them. An `LDR Rd,=ZeroPage` after a pool that already holds ZeroPage
+    /// loads from that one rather than asking for another.
+    placed_literals: Vec<(usize, u32, String)>,
     /// Local label definitions: (ROUT scope, number, address).
     locals: Vec<LocalDef>,
     /// The assembly-time variables as the caller left them: the `-PD`
@@ -406,6 +417,26 @@ struct Literal {
     /// The area of the instruction that asked for it. A pool in another area
     /// is not at a fixed distance, so that is an error rather than a fixup.
     area: usize,
+}
+
+/// Can an `LDR` at `here` reach a word at `there`?
+///
+/// The offset is twelve bits with a sign and is measured from `pc`, which
+/// reads eight past the instruction.
+fn in_ldr_range(here: u32, there: u32) -> bool {
+    let d = there as i64 - (here as i64 + 8);
+    (-4095..=4095).contains(&d)
+}
+
+/// Where the word an `LDR Rd,=value` loads from is going to be.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LiteralRef {
+    /// In a pool this pass has not placed yet: which pool, and where in it.
+    Pending(usize, u32),
+    /// In a pool already behind us, at this offset in the area. The manual
+    /// looks backwards first: "if no such literal already exists within the
+    /// addressable range, place the literal in the next literal pool".
+    Placed(u32),
 }
 
 /// A literal pool, once `LTORG` has said where it goes.
@@ -519,7 +550,7 @@ fn is_zero_size(up: &str) -> bool {
         up,
         "EXPORT" | "IMPORT" | "EXTERN" | "GLOBAL" | "KEEP" | "ENTRY" | "DATA"
             | "ARM" | "CODE32" | "REQUIRE" | "EXPORTAS" | "STRONG" | "RN" | "CN" | "FN"
-            | "DN" | "SN" | "NOFP" | "OPT" | "TTL" | "SUBT" | "ALIGN"
+            | "DN" | "SN" | "NOFP" | "OPT" | "TTL" | "SUBT" | "ALIGN" | "!" | "INFO"
     )
 }
 
@@ -563,6 +594,7 @@ impl<'a> Expander<'a> {
             exports: Vec::new(),
             imports: Vec::new(),
             data_fixups: Vec::new(),
+            assert_warnings: false,
             reg_aliases: std::collections::HashMap::new(),
             vfp_aliases: std::collections::HashMap::new(),
             fpa_aliases: std::collections::HashMap::new(),
@@ -573,6 +605,7 @@ impl<'a> Expander<'a> {
             pools_prev: Vec::new(),
             literal_sites: Vec::new(),
             literal_sites_prev: Vec::new(),
+            placed_literals: Vec::new(),
             locals: Vec::new(),
             locals_prev: Vec::new(),
             initial_vars: std::collections::HashMap::new(),
@@ -840,6 +873,11 @@ impl<'a> Expander<'a> {
         &self.imports
     }
 
+    /// Carry on past a failed `ASSERT`, reporting it. For listings.
+    pub fn set_assert_warnings(&mut self, on: bool) {
+        self.assert_warnings = on;
+    }
+
     /// Data fields the linker has to fill in.
     pub fn data_fixups(&self) -> &[DataFixup] {
         &self.data_fixups
@@ -950,6 +988,42 @@ impl<'a> Expander<'a> {
             return Some(format!("f{n}"));
         }
         None
+    }
+
+    /// Replace every local label reference in an expression with its address.
+    ///
+    /// The evaluator knows symbols, not local labels: it has no idea where it
+    /// is, and `%BT01` means nothing without that. So they are substituted
+    /// before evaluation, in the places where the location is known -- which
+    /// is how `ASSERT . - %BT01 = ...` can be checked at all, and the Kernel
+    /// checks its ARM operation tables that way.
+    fn substitute_locals(&self, text: &str, here: u32) -> String {
+        if !text.contains('%') {
+            return text.to_string();
+        }
+        let area = self.current_area_index();
+        let rout = self.rout.clone();
+        let cs: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < cs.len() {
+            if cs[i] != '%' {
+                out.push(cs[i]);
+                i += 1;
+                continue;
+            }
+            let start = i;
+            i += 1;
+            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') {
+                i += 1;
+            }
+            let text: String = cs[start..i].iter().collect();
+            match self.resolve_local(&text, here, area, rout.as_deref()) {
+                Some(a) => out.push_str(&a.to_string()),
+                None => out.push_str(&text),
+            }
+        }
+        out
     }
 
     /// Rewrite an instruction's operands into something the encoder can parse.
@@ -1125,6 +1199,7 @@ impl<'a> Expander<'a> {
         self.data_fixups.clear();
         self.literal_sites_prev = std::mem::take(&mut self.literal_sites);
         self.pending_literals.clear();
+        self.placed_literals.clear();
         // Every `GBLx` runs again in pass two, so the variables it declared
         // must go -- otherwise a header's `[ :LNOT: :DEF: Included_Hdr_Foo ]`
         // guard finds itself already set and the header, macros and all, is
@@ -1364,6 +1439,7 @@ impl<'a> Expander<'a> {
             "^" | "MAP" => self.do_map(&line)?,
             "#" | "FIELD" => self.do_field(&line)?,
             "ROUT" => self.do_rout(&line),
+            "!" | "INFO" => self.do_info(&line)?,
             "AREA" => self.do_area(&line)?,
             // Register/coprocessor/FP register names. The manual notes ObjAsm
             // "still permits register names in expressions (they are
@@ -1434,7 +1510,7 @@ impl<'a> Expander<'a> {
                 | "LCLA" | "LCLL" | "LCLS" | "SETA" | "SETL" | "SETS" | "END"
                 | "*" | "EQU" | "^" | "MAP" | "#" | "FIELD" | "ROUT" | "AREA"
                 | "RN" | "CN" | "FN" | "DN" | "SN" | "ASSERT" | "OPT" | "TTL" | "SUBT"
-                | "NOFP"
+                | "NOFP" | "!" | "INFO"
         )
     }
 
@@ -2067,11 +2143,15 @@ impl<'a> Expander<'a> {
         // not -- a forward `EQU`, most often.
         if let Some(prev) = self.literal_sites_prev.get(site).copied() {
             self.literal_sites.push(prev);
-            let (pool, offset) = prev?;
-            // Re-reserve it so the pool still knows its own size.
-            self.reserve_literal(&expr, area, Some(offset));
-            let p = self.pools_prev.get(pool).copied()?;
-            return Some(p.base + offset);
+            return match prev? {
+                LiteralRef::Placed(at) => Some(at),
+                LiteralRef::Pending(pool, offset) => {
+                    // Re-reserve it so the pool still knows its own size.
+                    self.reserve_literal(&expr, area, Some(offset));
+                    let p = self.pools_prev.get(pool).copied()?;
+                    Some(p.base + offset)
+                }
+            };
         }
 
         let value = match expr::eval(&expr, &self.syms) {
@@ -2089,8 +2169,24 @@ impl<'a> Expander<'a> {
             self.literal_sites.push(None);
             return None;
         }
+        // A pool already behind us may hold this value, and an LDR reaches
+        // backwards as readily as forwards. Only when none is in range does a
+        // new word get asked for.
+        let here = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
+        let trimmed = expr.trim();
+        if let Some((_, at, _)) = self
+            .placed_literals
+            .iter()
+            .rev()
+            .find(|(a, at, e)| *a == area && e == trimmed && in_ldr_range(here, *at))
+        {
+            let at = *at;
+            self.literal_sites.push(Some(LiteralRef::Placed(at)));
+            return Some(at);
+        }
         let offset = self.reserve_literal(&expr, area, None);
-        self.literal_sites.push(Some((self.pools.len(), offset)));
+        self.literal_sites
+            .push(Some(LiteralRef::Pending(self.pools.len(), offset)));
         // The pool has not been placed yet in this pass, so there is no
         // address to give back.
         None
@@ -2142,6 +2238,7 @@ impl<'a> Expander<'a> {
                 _ => 0,
             };
             bytes.extend_from_slice(&v.to_le_bytes());
+            self.placed_literals.push((area, base + l.offset, l.expr.clone()));
             // A pool word holding an address moves when the linker places the
             // area, exactly as `DCD Label` does.
             if let Some(kind) = self.fixup_kind(&l.expr) {
@@ -2214,13 +2311,95 @@ impl<'a> Expander<'a> {
         if self.pass_no == 1 {
             return Ok(());
         }
+        let here = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
         let src = self.expand_text(line.operands_str().unwrap_or(""));
+        let src = self.substitute_locals(&src, here);
         match expr::eval(&src, &self.syms) {
             Ok(Value::Logical(true)) => Ok(()),
-            Ok(Value::Logical(false)) => self.err(line.num, format!("assertion failed: {src}")),
+            Ok(Value::Logical(false)) => {
+                let why = self.explain_comparison(&src);
+                let msg = format!("assertion failed: {src}{why}");
+                if self.assert_warnings {
+                    let o = self.origin(line.num);
+                    eprintln!("{}:{}: {msg}", o.file, o.line);
+                    return Ok(());
+                }
+                self.err(line.num, msg)
+            }
             Ok(v) => self.err(line.num, format!("ASSERT needs a logical value, got {v:?}")),
             Err(e) => self.err(line.num, e.to_string()),
         }
+    }
+
+    /// `! is-error, string «,is-warning»`, and `INFO`, which is the same.
+    ///
+    /// From the manual: the arithmetic expression `is-error` is evaluated, and
+    /// if it is not zero the string is printed as an error and the assembly
+    /// halts after pass one. If it is zero, nothing happens on pass one and
+    /// the string is printed on pass two -- as a warning if the optional
+    /// `is-warning` expression is non-zero, and as a plain informational
+    /// message otherwise.
+    ///
+    /// It generates no code. The Kernel has four of these in its SWI
+    /// despatcher reporting where the entry points landed, and giving them a
+    /// word each put the despatcher sixteen bytes over the size it asserts.
+    fn do_info(&mut self, line: &Line) -> R<()> {
+        let src = self.expand_text(line.operands_str().unwrap_or(""));
+        let parts = layout::split_top_level(&src);
+        let value = |i: usize| -> u32 {
+            parts
+                .get(i)
+                .map(|t| match expr::eval(t.trim(), &self.syms) {
+                    Ok(Value::Arith(n)) => n,
+                    Ok(Value::Logical(b)) => b as u32,
+                    _ => 0,
+                })
+                .unwrap_or(0)
+        };
+        let message = match parts.get(1).map(|t| expr::eval(t.trim(), &self.syms)) {
+            Some(Ok(Value::Str(m))) => m,
+            // A message that will not evaluate is still worth showing.
+            _ => parts.get(1).map(|t| t.trim().to_string()).unwrap_or_default(),
+        };
+        let o = self.origin(line.num);
+        if value(0) != 0 {
+            return self.err(line.num, message);
+        }
+        if self.pass_no == 2 {
+            let kind = if value(2) != 0 { "warning" } else { "info" };
+            eprintln!("{}:{}: {kind}: {message}", o.file, o.line);
+        }
+        Ok(())
+    }
+
+    /// Both sides of a failed comparison, where the assertion is one.
+    ///
+    /// An assertion that fails says what it was checking but not by how much,
+    /// and the sources use them to check their own layout: the Kernel asserts
+    /// `{PC}-SVCDespatcher = SWIDespatch_Size`, and the useful part of that
+    /// failing is the difference between the two numbers.
+    fn explain_comparison(&self, src: &str) -> String {
+        let mut depth = 0i32;
+        let cs: Vec<char> = src.chars().collect();
+        for (i, c) in cs.iter().enumerate() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                // Only a bare `=`, not the tail of `<=`, `>=` or `/=`.
+                '=' if depth == 0 && !matches!(cs.get(i.wrapping_sub(1)), Some('<' | '>' | '/')) => {
+                    let (a, b) = (&src[..i], &src[i + 1..]);
+                    if let (Ok(Value::Arith(x)), Ok(Value::Arith(y))) =
+                        (expr::eval(a, &self.syms), expr::eval(b, &self.syms))
+                    {
+                        let d = y as i64 - x as i64;
+                        return format!(" ({x} against {y}, {d:+} out)");
+                    }
+                    return String::new();
+                }
+                _ => {}
+            }
+        }
+        String::new()
     }
 
     fn do_get(&mut self, line: &Line, chain: Chain) -> R<()> {

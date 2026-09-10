@@ -117,6 +117,9 @@ fn main() {
     let r = Dirs { dirs: all, vars };
     let mut e = Expander::new(&r);
     e.set_target_builtins();
+    // A listing is made to be compared, so a failed assertion is
+    // reported and the listing still produced.
+    e.set_assert_warnings(true);
     for pd in &pds {
         if let Err(err) = e.predefine(pd) {
             eprintln!("roslist: bad -PD {pd:?}: {err}");

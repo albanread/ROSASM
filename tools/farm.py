@@ -37,19 +37,52 @@ def worker_dir(i):
     return os.path.join(FARM, str(i))
 
 
+def safe_rmtree(path, root):
+    """Delete a tree without ever following a link out of it.
+
+    `shutil.rmtree` walks into a junction and deletes what is on the far side.
+    The emulator directory holds one, and a farm teardown once followed it and
+    took the boot disc and the DDE with it. A junction is removed here as the
+    link it is, with `os.rmdir`, which leaves its target alone.
+
+    `root` is the only place deletion is allowed to happen, checked after
+    resolving both, so a path that escapes by any means is refused rather than
+    obeyed.
+    """
+    path, root = os.path.abspath(path), os.path.abspath(root)
+    if os.path.commonpath([path, root]) != root or path == root:
+        raise ValueError(f"refusing to delete {path}, which is not inside {root}")
+    if not os.path.isdir(path):
+        return
+    for entry in os.scandir(path):
+        # A junction or symlink is removed, never entered.
+        if entry.is_junction() or entry.is_symlink():
+            (os.rmdir if entry.is_dir(follow_symlinks=False) else os.unlink)(entry.path)
+        elif entry.is_dir(follow_symlinks=False):
+            safe_rmtree(entry.path, root)
+        else:
+            os.chmod(entry.path, 0o600)
+            os.unlink(entry.path)
+    os.rmdir(path)
+
+
 def setup(workers):
     os.makedirs(FARM, exist_ok=True)
     for i in range(workers):
         d = worker_dir(i)
         if os.path.isdir(d):
-            shutil.rmtree(d, ignore_errors=True)
+            safe_rmtree(d, FARM)
         os.makedirs(d)
         for name in os.listdir(BASE):
             src = os.path.join(BASE, name)
             if name in SKIP_DIRS:
                 continue
+            # Copying a junction would put one in the worker directory, and
+            # the next teardown would be deleting through it again.
+            if os.path.isjunction(src) or os.path.islink(src):
+                continue
             if os.path.isdir(src):
-                shutil.copytree(src, os.path.join(d, name))
+                shutil.copytree(src, os.path.join(d, name), symlinks=True)
             else:
                 if os.path.splitext(name)[1].lower() in SKIP_EXT:
                     continue
