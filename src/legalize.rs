@@ -103,12 +103,13 @@ pub fn as_arm_immediate(v: u32) -> Option<(u32, u32)> {
 /// Either way, a value whose bits are spread too widely for the chosen end
 /// leaves a remainder no single field can hold, and the other end is tried.
 pub fn split_immediates(v: u32, max_parts: usize) -> Option<Vec<u32>> {
-    split_from_bottom(v, max_parts).or_else(|| split_from_top(v, max_parts))
+    split_from_top(v, max_parts).or_else(|| split_from_bottom(v, max_parts))
 }
 
-/// The same, for an offset the linker will supply.
+/// The same, for an offset the linker will supply. No different: the
+/// relocated pairs follow the same rule as the rest.
 pub fn split_immediates_relocated(v: u32, max_parts: usize) -> Option<Vec<u32>> {
-    split_from_top(v, max_parts).or_else(|| split_from_bottom(v, max_parts))
+    split_immediates(v, max_parts)
 }
 
 /// Highest field first, which is what ObjAsm writes.
@@ -596,11 +597,10 @@ mod tests {
         };
         assert_eq!(v.len(), 2);
         assert!(v.iter().all(|(m, _)| m == "ADDEQ"), "{v:?}");
-        // `pc` reads eight past the first, and an offset ObjAsm can work out
-        // is split from the low end -- here it fits one field, so the second
-        // instruction adds nothing.
-        assert_eq!(v[0].1, "r2, pc, #28");
-        assert_eq!(v[1].1, "r2, r2, #0");
+        // `pc` reads eight past the first, so the pair adds up to 28, and
+        // the first takes the field holding the highest set bit.
+        assert_eq!(v[0].1, "r2, pc, #16");
+        assert_eq!(v[1].1, "r2, r2, #12");
     }
 
     #[test]
