@@ -2680,16 +2680,36 @@ impl<'a> Expander<'a> {
         let site = self.literal_sites.len();
         let area = self.current_area_index();
 
-        // Pass two repeats pass one's decision, so both lay out the same
-        // bytes even where pass two could evaluate something pass one could
-        // not -- a forward `EQU`, most often.
+        // Pass two keeps pass one's layout, so both place the same bytes
+        // even where pass two can evaluate something pass one could not --
+        // a forward `EQU`, most often.
         if let Some(prev) = self.literal_sites_prev.get(site).copied() {
             self.literal_sites.push(prev);
+            // But not pass one's *instruction*. Taskman writes `LDR r3,
+            // =HeapSize` four thousand lines before `HeapSize * :INDEX: @`,
+            // so pass one had to reserve a pool word for a value it could
+            // not see. Pass two can, and a value an instruction can hold is
+            // loaded with one. The word stays reserved, unread, so every
+            // address after it is where pass one put it -- which is what
+            // ObjAsm's own object shows.
+            let now = match self.eval_expr(&expr) {
+                Ok(Value::Arith(n)) => Some(n),
+                _ => None,
+            };
+            let loadable = now.is_some_and(|v| {
+                crate::legalize::as_arm_immediate(v).is_some()
+                    || crate::legalize::as_arm_immediate(!v).is_some()
+            }) && !identifiers(&expr)
+                .iter()
+                .any(|n| self.label_defs.contains_key(n) || self.imports.contains(n));
             return match prev? {
-                LiteralRef::Placed(at) => Some(at),
+                LiteralRef::Placed(at) => (!loadable).then_some(at),
                 LiteralRef::Pending(pool, offset) => {
                     // Re-reserve it so the pool still knows its own size.
                     self.reserve_literal(&expr, area, Some(offset));
+                    if loadable {
+                        return None;
+                    }
                     let p = self.pools_prev.get(pool).copied()?;
                     Some(p.base + offset)
                 }
