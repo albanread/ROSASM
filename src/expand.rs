@@ -1272,6 +1272,22 @@ impl<'a> Expander<'a> {
             return Ok(());
         }
 
+        // A line whose opcode is a variable becomes a directive once it is
+        // substituted: the Kernel writes `$GetMEMM` where the build has set
+        // that to `GET Hdr:MEMM.VMSAv6`, choosing its page-table format by
+        // machine. ObjAsm substitutes before it decides what a line is, so the
+        // line is expanded and read again before being dispatched. Done after
+        // the skipping check, because a skipped line may name a variable that
+        // was never declared.
+        let (line, up) = if opcode.starts_with('$') {
+            let text = self.expand_text(&line.raw);
+            let relexed = lex::lex_line(line.num, &text);
+            let up = relexed.opcode_str().unwrap_or("").to_ascii_uppercase();
+            (relexed, up)
+        } else {
+            (line, up)
+        };
+
         // ObjAsm's listing carries every line, directives included, so record
         // them here. `emit_or_invoke` records its own, with bytes.
         if !matches!(up.as_str(), "" ) && !self.is_invocation_or_instruction(&up) {

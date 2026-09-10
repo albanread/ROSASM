@@ -24,6 +24,11 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import corpus_diff  # noqa: E402
 from corpus_diff import units  # noqa: E402
+from component_flags import (  # noqa: E402
+    assembler_flags,
+    component_dirs,
+    component_options,
+)
 from export_hdrs import components, export_hdrs  # noqa: E402
 
 ROSASM = r"F:\RISCOSDEV\rosasm\target\release\rosasm.exe"
@@ -65,6 +70,10 @@ def assemble(unit):
         args += ["-I", d]
     for pd in PD:
         args += ["-PD", pd]
+    # What the build itself would add for this component: the Kernel cannot
+    # assemble without them, because `hdr/Options` reads `FreezeDevRel` and
+    # nothing in the sources defines it.
+    args += assembler_flags(ROOT[0], unit.replace("\\", "/"), OPTIONS[0], DIRS[0])
     with tempfile.TemporaryDirectory() as tmp:
         args += ["-o", os.path.join(tmp, "out.o")]
         try:
@@ -103,6 +112,9 @@ def assemble(unit):
 
 
 HDRROOT = [None]
+ROOT = [None]
+OPTIONS = [{}]
+DIRS = [{}]
 
 
 def main():
@@ -122,6 +134,14 @@ def main():
         a.root, os.path.join(tempfile.gettempdir(), "rosasm-export"), a.build
     )
     in_build = components(a.root, a.build)
+    ROOT[0] = a.root
+    OPTIONS[0] = component_options(a.root, a.build)
+    DIRS[0] = component_dirs(a.root)
+    with_flags = sum(1 for v in OPTIONS[0].values() if v)
+    print(
+        f"[{len(OPTIONS[0])} components, {with_flags} with build options]",
+        file=sys.stderr,
+    )
     # Every one of them, because the headers name several in filenames --
     # `Hdr:HALSize.<HALSize>` cannot be found without knowing HALSize is 64K.
     PD[:] = [f'{k} SETS "{v}"' for k, v in sorted(variables.items())]
