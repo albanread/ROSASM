@@ -513,6 +513,21 @@ def collect(root, build, ref_dir, count, only=None):
                 if attempt == 2:
                     log = f"[the emulator stopped answering twice: {e}]"
             except OSError as e:
+                # An emulator that has exited leaves a broken pipe, which
+                # arrives here as an ordinary file error with no filename on
+                # it. Which it is, is settled by asking whether the process
+                # is still there rather than by reading the message.
+                if sh.p.poll() is not None:
+                    print(f"[restart after {unit}: {e}]", file=sys.stderr)
+                    try:
+                        sh.close()
+                    except Exception:
+                        pass
+                    sh = Shell(quiet=True)
+                    sh.boot()
+                    if attempt == 2:
+                        log = f"[the emulator stopped twice: {e}]"
+                    continue
                 # Staging, not the emulator: lose one unit, keep the instance.
                 # Named, because "Invalid argument" on its own says nothing
                 # about which file the host would not have.
