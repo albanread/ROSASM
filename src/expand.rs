@@ -2042,6 +2042,7 @@ impl<'a> Expander<'a> {
         };
         let name = strip_bars(&self.expand_text(name));
         let rhs = self.expand_text(line.operands_str().unwrap_or(""));
+        self.inherit_base(&name, &rhs);
         match self.eval_expr(&rhs) {
             Ok(Value::Arith(v)) => {
                 self.syms.define_absolute(&name, v);
@@ -2829,6 +2830,28 @@ impl<'a> Expander<'a> {
             Some((a, _)) if *a == area => Some(format!("({n}+{by})")),
             _ => None,
         })
+    }
+
+    /// A symbol defined from a register-relative one is register-relative.
+    ///
+    /// TaskWindow lays its workspace out under `^ 0, r12` and then writes
+    /// `key_name * ParameterBuffer+8`. That names a field of the block `r12`
+    /// points at as surely as the `#` that reserved it, and `LDR r2,
+    /// key_name` is a load from that block -- not a program-relative load of
+    /// an address, which is what it became without this.
+    ///
+    /// Two symbols on different registers in one expression have no meaning,
+    /// so nothing is inherited from that.
+    fn inherit_base(&mut self, name: &str, rhs: &str) {
+        let bases: Vec<u32> = identifiers(rhs)
+            .iter()
+            .filter_map(|n| self.field_bases.get(n).copied())
+            .collect();
+        if let Some(b) = bases.first() {
+            if bases.iter().all(|x| x == b) {
+                self.field_bases.insert(name.to_string(), *b);
+            }
+        }
     }
 
     /// The operand text with every assembly-time variable replaced by the
