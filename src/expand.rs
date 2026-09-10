@@ -258,6 +258,17 @@ enum Source {
         lines: Vec<Line>,
         pos: usize,
         args: HashMap<String, String>,
+        /// How many conditionals were open when the macro was entered, so
+        /// that `MEXIT` can discard whatever the body opened.
+        ///
+        /// `MEXIT` leaves from wherever it stands, which is normally inside
+        /// the `[` that decided to leave: `Immediate` in Hdr:Macros tests a
+        /// rotation, sets its flag and exits, with the `]` three lines below
+        /// never reached. Reaching `MEND` normally is a different matter --
+        /// the manual has conditionals interleaving with expansion rather
+        /// than nesting inside it, and a body may deliberately open one for
+        /// its caller to close.
+        conds: usize,
     },
     /// A `WHILE` body, re-run until its condition goes false.
     Loop {
@@ -302,7 +313,11 @@ pub struct Expander<'a> {
     resolver: &'a dyn FileResolver,
     /// One entry per open `[`: whether this branch is being assembled, and
     /// whether any branch of this conditional has been taken yet.
-    conds: Vec<(bool, bool)>,
+    /// One entry per open `[`: whether this branch is active, whether any
+    /// branch has been taken, and where the `[` was written. The last is only
+    /// ever read to say which one never closed, which is the whole
+    /// diagnostic: the corpus nests these ten deep across included files.
+    conds: Vec<(bool, bool, Origin)>,
     /// The `@` storage-map counter, set by MAP and advanced by FIELD.
     map_counter: u32,
     /// Label of the enclosing `ROUT`, if it had one.
@@ -776,7 +791,7 @@ impl<'a> Expander<'a> {
 
     /// Are we inside a conditional branch that is not being assembled?
     fn skipping(&self) -> bool {
-        self.conds.iter().any(|(active, _)| !active)
+        self.conds.iter().any(|(active, _, _)| !active)
     }
 
     /// Assemble, in two passes, as ObjAsm does.
@@ -819,8 +834,15 @@ impl<'a> Expander<'a> {
         while let Some(item) = self.next_line()? {
             self.step(item)?;
         }
-        if !self.conds.is_empty() {
-            return self.err(0, "unclosed conditional at end of input");
+        if let Some((_, _, o)) = self.conds.last() {
+            let where_ = if o.macros.is_empty() {
+                format!("{}:{}", o.file, o.line)
+            } else {
+                format!("{}:{} in {}", o.file, o.line, o.macros.join(" < "))
+            };
+            let depth = self.conds.len();
+            let more = if depth > 1 { format!(", {} still open", depth) } else { String::new() };
+            return self.err(0, format!("'[' at {where_} was never closed{more}"));
         }
         // The manual makes a missing END an error; being lenient about it
         // costs nothing and losing the pool would be silent corruption.
@@ -1496,13 +1518,13 @@ impl<'a> Expander<'a> {
         // malformed expressions that only assemble because they are skipped.
         if self.skipping() {
             match up.as_str() {
-                "[" | "IF" => self.conds.push((false, true)),
+                "[" | "IF" => self.conds.push((false, true, self.origin(line.num))),
                 "|" | "ELSE" => {
                     // Flip on only if every enclosing level is itself active;
                     // an ELSE inside a skipped outer branch stays skipped.
                     if !self.conds.is_empty() {
-                        let outer_ok = self.conds[..self.conds.len() - 1].iter().all(|(a, _)| *a);
-                        let (active, taken) = self.conds.last_mut().unwrap();
+                        let outer_ok = self.conds[..self.conds.len() - 1].iter().all(|(a, _, _)| *a);
+                        let (active, taken, _) = self.conds.last_mut().unwrap();
                         if outer_ok && !*taken {
                             *active = true;
                             *taken = true;
@@ -1518,7 +1540,7 @@ impl<'a> Expander<'a> {
                     // branch has been taken, which is also the only case where
                     // the expression is guaranteed to be meaningful.
                     if !self.conds.is_empty() {
-                        let outer_ok = self.conds[..self.conds.len() - 1].iter().all(|(a, _)| *a);
+                        let outer_ok = self.conds[..self.conds.len() - 1].iter().all(|(a, _, _)| *a);
                         let taken = self.conds.last().unwrap().1;
                         let b = if outer_ok && !taken {
                             let cond = self.expand_text(line.operands_str().unwrap_or(""));
@@ -1526,7 +1548,7 @@ impl<'a> Expander<'a> {
                         } else {
                             false
                         };
-                        let (active, taken) = self.conds.last_mut().unwrap();
+                        let (active, taken, _) = self.conds.last_mut().unwrap();
                         *active = b;
                         *taken |= b;
                     }
@@ -1582,10 +1604,10 @@ impl<'a> Expander<'a> {
                 // Substitute before evaluating: `[ $on = 1` inside a macro.
                 let cond = self.expand_text(line.operands_str().unwrap_or(""));
                 let b = self.eval_logical(&cond, line.num)?;
-                self.conds.push((b, b));
+                self.conds.push((b, b, self.origin(line.num)));
             }
             "|" | "ELSE" => match self.conds.last_mut() {
-                Some((active, taken)) => {
+                Some((active, taken, _)) => {
                     *active = !*taken;
                     if *active {
                         *taken = true;
@@ -1596,7 +1618,7 @@ impl<'a> Expander<'a> {
             // Reached only with this level active, so an earlier branch was
             // taken and this one cannot be.
             "ELIF" => match self.conds.last_mut() {
-                Some((active, _)) => *active = false,
+                Some((active, _, _)) => *active = false,
                 None => return self.err(line.num, "ELIF without a matching IF"),
             },
             "]" | "ENDIF" => {
@@ -2683,9 +2705,11 @@ impl<'a> Expander<'a> {
                 Source::Loop { .. } => {
                     self.stack.pop();
                 }
-                Source::Macro { .. } => {
+                Source::Macro { conds, .. } => {
+                    let depth = *conds;
                     self.stack.pop();
                     self.syms.pop_frame();
+                    self.conds.truncate(depth);
                     return Ok(());
                 }
                 Source::File { .. } => break,
@@ -2873,6 +2897,7 @@ impl<'a> Expander<'a> {
             lines: m.body,
             pos: 0,
             args,
+            conds: self.conds.len(),
         });
         Ok(())
     }
@@ -3004,7 +3029,7 @@ mod tests {
 
     #[test]
     fn unclosed_conditional_is_an_error() {
-        assert!(fails("        [ {TRUE}\n        MOV r0, #1\n").contains("unclosed"));
+        assert!(fails("        [ {TRUE}\n        MOV r0, #1\n").contains("never closed"));
     }
 
     // ---- variables ------------------------------------------------------
@@ -3784,5 +3809,60 @@ mod macro_label_tests {
             .expect("assembles");
         assert_eq!(e.label_defs().get("Target").map(|(_, a)| *a), Some(4));
         assert!(!e.label_defs().contains_key("$label"));
+    }
+}
+
+#[cfg(test)]
+mod macro_conditional_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn assemble(src: &[&str]) -> R<Vec<ExpandedLine>> {
+        let r = MapResolver(HashMap::new());
+        let mut e = Expander::new(&r);
+        e.run("test", src.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// `Immediate` in Hdr:Macros: the `MEXIT` that reports success stands
+    /// inside the `[` that found it, and the `]` three lines below is never
+    /// reached. Ten units in the corpus fail to assemble at all if what the
+    /// macro left open outlives it.
+    #[test]
+    fn mexit_from_inside_a_conditional_closes_it() {
+        let out = assemble(&[
+            "        AREA    x, CODE, READONLY",
+            "        GBLL    found",
+            "        MACRO",
+            "        Look    $n",
+            "found   SETL    {FALSE}",
+            " [ $n = 1",
+            "found   SETL    {TRUE}",
+            "        MEXIT",
+            " ]",
+            "        MEND",
+            "        Look    1",
+            "        MOV     r0, #0",
+            "        END",
+        ])
+        .expect("assembles");
+        // The instruction after the invocation is reached and is not skipped.
+        assert!(out.iter().any(|l| !l.listing_only && l.text.contains("MOV")));
+    }
+
+    /// A conditional the file itself left open is still an error, and says
+    /// where it was opened -- the corpus nests these across included files
+    /// and a bare "unclosed conditional" names nothing to look at.
+    #[test]
+    fn an_unclosed_conditional_in_a_file_names_its_line() {
+        let e = assemble(&[
+            "        AREA    x, CODE, READONLY",
+            " [ {TRUE}",
+            "        MOV     r0, #0",
+            "        END",
+        ])
+        .expect_err("does not assemble");
+        let text = e.to_string();
+        assert!(text.contains("test:2"), "{text}");
+        assert!(text.contains("never closed"), "{text}");
     }
 }
