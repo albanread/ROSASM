@@ -112,15 +112,28 @@ def stage_headers(hdrdirs):
         shutil.copytree(d, dest, dirs_exist_ok=True)
 
 
+STAGED = [None]
+
+
 def stage_unit(unit, generated):
     """Copy the unit's whole component across, and anything generated for it.
 
     The whole `s/`, not just the unit: `GetAll` is one file that GETs two
     hundred others, and a component that assembles from one directory expects
     the rest of it to be there.
+
+    A component holding several units is staged once. The Kernel's is nine
+    hundred files and copying it again for each of its units was most of the
+    time a run spent, so what changes between them -- the object directory --
+    is cleared and the rest left where it is.
     """
     comp = os.path.dirname(os.path.dirname(unit))
+    if STAGED[0] == (comp, tuple(generated)):
+        rm(os.path.join(STAGE, "o"))
+        os.makedirs(os.path.join(STAGE, "o"), exist_ok=True)
+        return comp
     rm(STAGE)
+    STAGED[0] = (comp, tuple(generated))
     os.makedirs(os.path.join(STAGE, "o"), exist_ok=True)
     for name in ("s", "hdr", "Hdr"):
         src = os.path.join(comp, name)
@@ -133,7 +146,7 @@ def stage_unit(unit, generated):
     # only what is staged.
     for name in os.listdir(comp):
         src = os.path.join(comp, name)
-        if os.path.isfile(src):
+        if os.path.isfile(src) and not name.startswith("."):
             shutil.copy2(src, os.path.join(STAGE, name))
     # A generated source -- `s.TokHelpSrc` and the like -- sits alongside.
     for i, arg in enumerate(generated):
@@ -195,7 +208,7 @@ def objasm(sh, unit, predefines, extra_i, variables, hdrdirs):
     # HostFS buffers: wait for Windows to see the file.
     for suffix in (",ffd", ""):
         path = os.path.join(STAGE, "o", name + suffix)
-        deadline = time.time() + 20.0
+        deadline = time.time() + 5.0
         while not os.path.isfile(path) and time.time() < deadline:
             time.sleep(0.2)
         if os.path.isfile(path):
@@ -269,6 +282,7 @@ def compare_one(setup, sh, unit, limit, keep, full=False):
     )
     if not keep:
         rm(STAGE)
+        STAGED[0] = None
     return ("same" if d.returncode == 0 else "differ"), d.stdout.strip()
 
 
