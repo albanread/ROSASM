@@ -82,12 +82,28 @@ pub fn as_arm_immediate(v: u32) -> Option<(u32, u32)> {
     None
 }
 
-/// Split a value into a sum of ARM immediates, smallest number first.
+/// Split a value into a sum of ARM immediates.
 ///
-/// Takes the lowest set bit each time and consumes the eight bits above it,
-/// which is what ObjAsm does when expanding `ADRL`. Returns `None` if more
-/// parts would be needed than allowed.
-pub fn split_immediates(mut v: u32, max_parts: usize) -> Option<Vec<u32>> {
+/// Each part is the eight-bit field at some even rotation. Returns `None` if
+/// more parts would be needed than allowed.
+///
+/// Which end it starts from is not a matter of taste. BCMSupport's device
+/// veneers are nine `ADRL`s at an imported symbol, and ObjAsm writes the
+/// first as `SUB ip, pc, #&20` / `SUB ip, ip, #&C` -- the field holding the
+/// highest set bit, then the remainder -- where working up from the low end
+/// gives `#&2C` and `#0`. Both reach the same address; only one is the same
+/// object file.
+///
+/// A value whose bits are spread too widely for that leaves a remainder no
+/// single field can hold, and there the low end is tried instead. Nothing in
+/// the corpus says what ObjAsm does with one, and refusing an `ADRL` that
+/// used to assemble would be the worse guess.
+pub fn split_immediates(v: u32, max_parts: usize) -> Option<Vec<u32>> {
+    split_from_top(v, max_parts).or_else(|| split_from_bottom(v, max_parts))
+}
+
+/// Highest field first, which is what ObjAsm writes.
+fn split_from_top(mut v: u32, max_parts: usize) -> Option<Vec<u32>> {
     if v == 0 {
         return Some(vec![0]);
     }
@@ -96,8 +112,33 @@ pub fn split_immediates(mut v: u32, max_parts: usize) -> Option<Vec<u32>> {
         if parts.len() == max_parts {
             return None;
         }
-        // Round the lowest set bit down to an even position, since the
-        // rotation is by an even number of bits.
+        // The last part has to take everything that is left.
+        if parts.len() + 1 == max_parts {
+            as_arm_immediate(v)?;
+            parts.push(v);
+            break;
+        }
+        // Round the highest set bit down to an even position, since the
+        // rotation is by an even number of bits, and take the eight bits
+        // from there.
+        let high = (31 - v.leading_zeros()) & !1;
+        let part = v & (0xFFu32 << high);
+        parts.push(part);
+        v &= !part;
+    }
+    Some(parts)
+}
+
+/// Lowest field first, which needs the fewest parts.
+fn split_from_bottom(mut v: u32, max_parts: usize) -> Option<Vec<u32>> {
+    if v == 0 {
+        return Some(vec![0]);
+    }
+    let mut parts = Vec::new();
+    while v != 0 {
+        if parts.len() == max_parts {
+            return None;
+        }
         let low = v.trailing_zeros() & !1;
         let part = v & (0xFF << low);
         if part == 0 {
@@ -525,7 +566,11 @@ mod tests {
         };
         assert_eq!(v.len(), 2);
         assert!(v.iter().all(|(m, _)| m == "ADDEQ"), "{v:?}");
-        assert_eq!(v[0].1, "r2, pc, #28", "pc reads eight past the first");
+        // `pc` reads eight past the first, so the pair adds up to 28 -- and
+        // the first takes the field holding the highest set bit, as ObjAsm
+        // writes it.
+        assert_eq!(v[0].1, "r2, pc, #16");
+        assert_eq!(v[1].1, "r2, r2, #12");
     }
 
     #[test]

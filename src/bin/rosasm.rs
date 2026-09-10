@@ -127,7 +127,7 @@ impl FileResolver for Dirs {
 /// Data directives are not re-emitted: their bytes were computed during
 /// expansion, where `@`, `?label` and the ObjAsm operators are meaningful.
 /// Only instructions go to LLVM.
-fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>) {
+fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>, Vec<AdrReloc>) {
     // The directives have to agree with the command line, and they win where
     // they disagree: `.fpu neon` is VFPv3 and would refuse the A72's fused
     // multiply-adds however the driver was invoked.
@@ -138,6 +138,7 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>) {
          \x20       .text\n",
     );
     let mut index = Vec::new();
+    let mut adr_relocs: Vec<AdrReloc> = Vec::new();
     for (i, l) in lines.iter().enumerate() {
         if l.listing_only || !l.bytes.is_empty() {
             continue;
@@ -182,6 +183,15 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>) {
         }
         // Legalization decides what the instruction can become: itself, an
         // expansion, or nothing the encoder will accept.
+        // An `ADR` at an imported symbol carries a relocation of its own:
+        // the encoder is handed arithmetic on `pc` and has nothing to record.
+        if let Some(name) = adr_external(op, &operands, ex) {
+            adr_relocs.push(AdrReloc {
+                line: i,
+                name,
+                instructions: rosasm::lower::instruction_words(op) as u8,
+            });
+        }
         let ctx = legalize::Context {
             here: l.addr,
             target: adr_target(op, &operands, l, ex),
@@ -202,7 +212,16 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>) {
         }
         index.push(i);
     }
-    (s, index)
+    (s, index, adr_relocs)
+}
+
+/// An `ADR` whose target only the linker knows.
+struct AdrReloc {
+    /// Index into the expanded lines, which is how its bytes are found again.
+    line: usize,
+    name: String,
+    /// How many instructions the linker may rewrite: `ADRL` is two.
+    instructions: u8,
 }
 
 /// The space an instruction was given, filled with nothing.
@@ -254,11 +273,41 @@ fn pool_load(mnemonic: &str, operands: &str, here: u32, target: u32) -> Result<S
 ///
 /// A target in another area has no fixed distance from here, so it is refused
 /// rather than expanded into something that would only be right by accident.
+/// The imported symbol an `ADR` reaches for, if that is what it names.
+///
+/// `ADRL ip, cpuclock_Activate` in BCMSupport's device veneers: the symbol
+/// is `IMPORT`ed, so its address is not known here and cannot be. ObjAsm
+/// assembles the address as zero and leaves a relocation on the pair of
+/// instructions for the linker to finish, which is what this makes possible.
+fn adr_external(op: &str, operands: &str, ex: &Expander) -> Option<String> {
+    if !rosasm::lower::is_adr(op) && !rosasm::lower::is_adrl(op) {
+        return None;
+    }
+    let target = operands.split_once(',')?.1.trim();
+    let names = expand::identifiers(target);
+    let mut wanted = names.iter().filter(|n| ex.imports().contains(n));
+    let name = wanted.next()?.clone();
+    // One is a relocation; two in one expression is a distance the linker has
+    // no way to compute.
+    wanted.next().is_none().then_some(name)
+}
+
 fn adr_target(op: &str, operands: &str, l: &ExpandedLine, ex: &Expander) -> Option<AdrTarget> {
     if !rosasm::lower::is_adr(op) && !rosasm::lower::is_adrl(op) {
         return None;
     }
     let target = operands.split_once(',')?.1.trim();
+
+    // An imported symbol has no address here. ObjAsm assembles the expression
+    // with it standing at zero and relocates; the instructions come out the
+    // same either way, and the relocation supplies the rest.
+    if let Some(name) = adr_external(op, operands, ex) {
+        let text = target.replace(&name, "0");
+        return match rosasm::expr::eval(&text, ex.symbols()) {
+            Ok(rosasm::symtab::Value::Arith(n)) => Some(AdrTarget::Program(n)),
+            _ => None,
+        };
+    }
 
     // Program-relative: `.`, or an expression built on it such as the
     // `dtanid + (16 * 3)` the sources write.
@@ -316,6 +365,8 @@ struct Segment {
     /// Index of the area it was copied into, and the offset there.
     area: usize,
     dest: u32,
+    /// The expanded line it came from.
+    line: usize,
 }
 
 fn word_at(b: &[u8], off: u32) -> u32 {
@@ -487,7 +538,7 @@ fn main() {
     }
 
     // Encode the instructions.
-    let (ual, index) = to_ual(&lines, &ex);
+    let (ual, index, adr_relocs) = to_ual(&lines, &ex);
     let tmp = std::env::temp_dir().join(format!("rosasm-{}", std::process::id()));
     let asm_path = tmp.with_extension("s");
     let obj_path = tmp.with_extension("o");
@@ -602,6 +653,7 @@ fn main() {
                     text: from..to,
                     area: l.area_index,
                     dest: area.data.len() as u32,
+                    line: i,
                 });
                 area.data.extend_from_slice(&text[from..to]);
             }
@@ -765,6 +817,25 @@ fn main() {
                 max_instructions: 1,
             });
         }
+    }
+
+    // `ADR` at an imported symbol. The instructions are arithmetic on `pc`
+    // with the symbol taken to stand at zero, so the encoder had nothing to
+    // record and the relocation is added here, against the first of them.
+    for a in &adr_relocs {
+        let Some(seg) = segments.iter().find(|s| s.line == a.line) else {
+            continue;
+        };
+        let idx = symbol_index(&mut symbols, &a.name);
+        let Some(area) = areas.get_mut(seg.area) else { continue };
+        area.relocs.push(aof::Reloc {
+            offset: seg.dest,
+            by: aof::RelocBy::Symbol(idx),
+            field: aof::FieldType::Instruction,
+            pc_relative: true,
+            based: false,
+            max_instructions: a.instructions,
+        });
     }
 
     // Data fields the expander could not finish.
