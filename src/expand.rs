@@ -1678,6 +1678,10 @@ impl<'a> Expander<'a> {
             let name = strip_bars(&self.expand_text(label));
             if !name.is_empty() {
                 self.syms.define_absolute(&name, self.map_counter);
+                // `?symbol` is what the line defining it reserved, and a
+                // FIELD reserves its size. The Kernel checks its workspace
+                // this way: `ASSERT ?LargeCommon >= SpriteCBsize + ...`.
+                self.syms.define_absolute(&format!("?{name}"), size);
                 // Under a `MAP expr,Rn` the symbol is an offset from Rn, not
                 // an address, and `ADR` on it has to say so.
                 if let Some(base) = self.map_base {

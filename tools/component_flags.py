@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""What the build hands the assembler, component by component.
+"""What the build hands the assembler, component by component: flags, and the
+source it generates first.
 
     component_flags.py <RiscOS dir> [--build BCM2835] [--component Kernel]
 
@@ -53,10 +54,12 @@ import argparse
 import os
 import re
 import shlex
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from export_hdrs import read  # noqa: E402
+import hosttools  # noqa: E402
+from export_hdrs import read, riscos_path  # noqa: E402
 
 # `ASFLAGS = ...` or `ASFLAGS += ...`, over as many backslashed lines as it
 # likes. The `+=` is what makes order matter.
@@ -383,3 +386,78 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ------------------------------------------------------- generated source
+
+# Components already tokenised this run: the same help text serves every unit
+# in the component, and there are eighteen of them.
+_TOKENISED = {}
+
+
+def generated_sources(root, unit, options, dirs, stage, hdrdirs, log=None):
+    """Run the build steps that make assembler source, returning `-I` paths.
+
+    One step so far. A component that sets `TOKHELPSRC = ${TOKENSOURCE}` has
+    its help text put through `tokenise` before anything is assembled, and the
+    result -- `s.TokHelpSrc` by default -- is `GET` by a source file that will
+    not assemble without it. Eighteen components do this, the Kernel among
+    them.
+
+    The output goes to a staging directory rather than into the component, so
+    a checkout stays as it was found; an `-I` pointing at that directory is
+    what makes `GET s.TokHelpSrc` resolve.
+    """
+    name = component_of(unit, options, dirs)
+    if name is None:
+        return []
+    if name in _TOKENISED:
+        return _TOKENISED[name]
+
+    comp = dirs[name]
+    texts = [
+        read(os.path.join(comp, f))
+        for f in sorted(os.listdir(comp))
+        if f == "Makefile" or f.endswith(".mk")
+    ]
+    macros = macros_of(texts, options.get(name, {}))
+    _TOKENISED[name] = []
+    if "TOKHELPSRC" not in macros or not macros.get("HELPSRC"):
+        return []
+
+    tokenise = hosttools.build("tokenise")
+    if tokenise is None:
+        if log is not None:
+            log.append(f"{name}: needs tokenise, which is not built")
+        return []
+
+    helpsrc = os.path.join(comp, riscos_path(macros["HELPSRC"]))
+    if not os.path.isfile(helpsrc):
+        if log is not None:
+            log.append(f"{name}: HELPSRC {macros['HELPSRC']} is not there")
+        return []
+
+    # `TOKENS ?= Hdr:Tokens`, which lives in the export tree like any header.
+    tokens = macros.get("TOKENS", "Hdr:Tokens").split(":")[-1]
+    found = None
+    for d in list(hdrdirs) + [os.path.join(comp, "hdr")]:
+        p = os.path.join(d, riscos_path(tokens))
+        if os.path.isfile(p):
+            found = p
+            break
+    if found is None:
+        if log is not None:
+            log.append(f"{name}: cannot find the token table {tokens}")
+        return []
+
+    out = os.path.join(stage, name, riscos_path(macros.get("TOKENSOURCE", "s.TokHelpSrc")))
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    r = subprocess.run(
+        [tokenise, found, helpsrc, out], capture_output=True, text=True
+    )
+    if r.returncode != 0 or not os.path.isfile(out):
+        if log is not None:
+            log.append(f"{name}: tokenise failed: {r.stdout.strip()} {r.stderr.strip()}")
+        return []
+    _TOKENISED[name] = ["-I", os.path.join(stage, name)]
+    return _TOKENISED[name]

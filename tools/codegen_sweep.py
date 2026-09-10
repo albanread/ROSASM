@@ -28,6 +28,7 @@ from component_flags import (  # noqa: E402
     assembler_flags,
     component_dirs,
     component_options,
+    generated_sources,
 )
 from export_hdrs import components, export_hdrs  # noqa: E402
 
@@ -74,6 +75,11 @@ def assemble(unit):
     # assemble without them, because `hdr/Options` reads `FreezeDevRel` and
     # nothing in the sources defines it.
     args += assembler_flags(ROOT[0], unit.replace("\\", "/"), OPTIONS[0], DIRS[0])
+    # Source the build generates before it assembles: the Kernel's help text
+    # is tokenised into `s.TokHelpSrc`, which one of its files GETs.
+    args += generated_sources(
+        ROOT[0], unit.replace("\\", "/"), OPTIONS[0], DIRS[0], STAGE[0], HDRROOT[0]
+    )
     with tempfile.TemporaryDirectory() as tmp:
         args += ["-o", os.path.join(tmp, "out.o")]
         try:
@@ -115,6 +121,7 @@ HDRROOT = [None]
 ROOT = [None]
 OPTIONS = [{}]
 DIRS = [{}]
+STAGE = [None]
 
 
 def main():
@@ -137,6 +144,7 @@ def main():
     ROOT[0] = a.root
     OPTIONS[0] = component_options(a.root, a.build)
     DIRS[0] = component_dirs(a.root)
+    STAGE[0] = os.path.join(tempfile.gettempdir(), "rosasm-generated")
     with_flags = sum(1 for v in OPTIONS[0].values() if v)
     print(
         f"[{len(OPTIONS[0])} components, {with_flags} with build options]",

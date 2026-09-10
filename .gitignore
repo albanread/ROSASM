@@ -8,3 +8,6 @@ __pycache__/
 
 # Per-instance farm summaries, written by tools/farm.py.
 /tools/.farm-*.txt
+
+# Host tools built from the RISC OS BuildHost sources by tools/hosttools.py.
+/tools/hostbin/
