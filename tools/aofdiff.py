@@ -259,7 +259,7 @@ def ours(unit, comp, hdrdirs, predefines, extra, out_path):
 class Setup:
     """Everything both assemblers need, worked out once."""
 
-    def __init__(self, root, build):
+    def __init__(self, root, build, stage=True):
         self.root = root
         self.options = component_options(root, build)
         self.dirs = component_dirs(root)
@@ -269,7 +269,9 @@ class Setup:
         )
         self.base = [f'{k} SETS "{v}"' for k, v in sorted(self.variables.items())]
         self.staged = os.path.join(tmp, "rosasm-generated")
-        stage_headers(self.hdrdirs)
+        # Only the emulator needs the headers where it can reach them.
+        if stage:
+            stage_headers(self.hdrdirs)
 
     def inputs_for(self, unit):
         """The predefines and generated sources this unit needs."""
@@ -408,6 +410,133 @@ def many(root, build, limit, count, out):
     return 0 if tally.get("differ", 0) == 0 else 1
 
 
+def reference_paths(ref_dir, root, unit):
+    """Where one unit's reference object and log are kept.
+
+    Named by the unit's place in the tree, so the set can be read by anyone
+    who has the sources and says plainly which unit each object came from.
+    """
+    rel = os.path.relpath(unit, os.path.join(root, "Sources")).replace("\\", "/")
+    base = os.path.join(ref_dir, rel)
+    return base + ".o", base + ".log"
+
+
+def collect(root, build, ref_dir, count):
+    """ObjAsm over every unit, once, keeping what it produces.
+
+    ObjAsm's answer depends on the sources and on nothing else. It is the
+    same answer every time *this* assembler changes, which is many times an
+    hour, and it costs a minute of emulation each time it is asked. Asking
+    once and keeping the objects turns every comparison after it into a
+    local one.
+    """
+    from corpus_diff import units
+
+    setup = Setup(root, build)
+    us = units(root)
+    if count:
+        us = us[:count]
+    sh = Shell(quiet=True)
+    sh.boot()
+    kept = failed = 0
+    for n, unit in enumerate(us, 1):
+        obj_path, log_path = reference_paths(ref_dir, root, unit)
+        os.makedirs(os.path.dirname(obj_path), exist_ok=True)
+        try:
+            predefines, generated = setup.inputs_for(unit)
+            stage_unit(unit, generated)
+            theirs, log = objasm(sh, unit, predefines, "", setup.variables, setup.hdrdirs)
+        except OSError as e:
+            # Staging, not the emulator: lose one unit and keep the instance.
+            print(f"[staging failed for {unit}: {e}]", file=sys.stderr)
+            continue
+        except Exception as e:
+            print(f"[restart after {unit}: {e}]", file=sys.stderr)
+            try:
+                sh.close()
+            except Exception:
+                pass
+            sh = Shell(quiet=True)
+            sh.boot()
+            continue
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(log or "")
+        if theirs is None:
+            failed += 1
+        else:
+            shutil.copy2(theirs, obj_path)
+            kept += 1
+        if n % 10 == 0:
+            print(f"  {n}/{len(us)}  {kept} kept, {failed} refused", flush=True)
+    try:
+        sh.close()
+    except Exception:
+        pass
+    print()
+    print(f"units            {len(us)}")
+    print(f"objects kept     {kept}")
+    print(f"ObjAsm refused   {failed}")
+    print(f"written to {ref_dir}")
+    return 0
+
+
+def against(root, build, ref_dir, limit, count, out):
+    """Compare with the reference set, which needs no emulator at all."""
+    from corpus_diff import units
+
+    setup = Setup(root, build, stage=False)
+    us = units(root)
+    if count:
+        us = us[:count]
+    tally = {}
+    report = open(out, "w", encoding="utf-8") if out else None
+    mine = os.path.join(os.environ.get("TEMP", "."), "rosasm-ours.o")
+    for n, unit in enumerate(us, 1):
+        label = os.path.relpath(unit, os.path.join(root, "Sources"))
+        obj_path, _ = reference_paths(ref_dir, root, unit)
+        if not os.path.isfile(obj_path):
+            # ObjAsm produced nothing for this unit, so there is nothing to
+            # be right or wrong against.
+            verdict, detail = "no-reference", ""
+        else:
+            predefines, generated = setup.inputs_for(unit)
+            comp = os.path.dirname(os.path.dirname(unit))
+            if os.path.isfile(mine):
+                os.unlink(mine)
+            r = ours(unit, comp, setup.hdrdirs, predefines, generated, mine)
+            if r.returncode != 0 or not os.path.isfile(mine):
+                verdict = "ours-failed"
+                detail = "\n".join(r.stderr.strip().splitlines()[-8:])
+            else:
+                d = subprocess.run(
+                    [AOFDUMP, mine, "--against", obj_path, "-n", str(limit)],
+                    capture_output=True,
+                    text=True,
+                )
+                verdict = "same" if d.returncode == 0 else "differ"
+                detail = d.stdout.strip()
+        tally[verdict] = tally.get(verdict, 0) + 1
+        write_row(report, verdict, label, detail)
+        if n % 25 == 0:
+            print(f"  {n}/{len(us)}  {tally}", flush=True)
+
+    order = ["same", "differ", "ours-failed", "no-reference"]
+    print()
+    print(f"units compared   {sum(tally.values())}")
+    for k in order:
+        if k in tally:
+            print(f"  {k:15} {tally[k]}")
+    agreed = tally.get("same", 0)
+    both = agreed + tally.get("differ", 0)
+    if both:
+        print(f"\nof the {both} both assembled, {agreed} are identical "
+              f"({100 * agreed / both:.1f}%)")
+    if report is not None:
+        report.close()
+        print(f"written to {out}")
+    return 0 if tally.get("differ", 0) == 0 else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
@@ -419,7 +548,21 @@ def main():
     ap.add_argument("--keep", action="store_true", help="leave the staged files")
     ap.add_argument("-n", type=int, default=12, help="differing words to show")
     ap.add_argument("--full", action="store_true", help="print ObjAsm's whole log")
+    ap.add_argument(
+        "--collect",
+        metavar="DIR",
+        help="assemble every unit with ObjAsm once and keep the objects here",
+    )
+    ap.add_argument(
+        "--against",
+        metavar="DIR",
+        help="compare with a collected set, without the emulator",
+    )
     a = ap.parse_args()
+    if a.collect:
+        raise SystemExit(collect(a.root, a.build, a.collect, a.limit))
+    if a.against:
+        raise SystemExit(against(a.root, a.build, a.against, a.n, a.limit, a.out))
     if a.all:
         raise SystemExit(many(a.root, a.build, a.n, a.limit, a.out))
     if not a.unit:
