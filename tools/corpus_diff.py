@@ -113,6 +113,12 @@ def units(root):
 def build_export_root(root):
     """Approximate the build's export_hdrs step.
 
+    Superseded by `export_hdrs.py`, which does it properly: the real phase
+    copies a declared list of headers into Global and Interface, and unioning
+    every `hdr/` picks a winner at random wherever two components share a
+    leafname. This remains only because the emulator harness stages onto a RISC
+    OS disc and has not been moved over yet.
+
     `Hdr:Wimp` lives in Desktop/Wimp/hdr, `Hdr:ModHand` in Kernel/hdr, and so
     on: the export root is the union of every component's `hdr/`, which
     export_hdrs assembles during a real build. Union them here instead.

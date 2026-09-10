@@ -23,11 +23,13 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import corpus_diff  # noqa: E402
-from corpus_diff import BUILD_VARS, units  # noqa: E402
+from corpus_diff import units  # noqa: E402
+from export_hdrs import components, export_hdrs  # noqa: E402
 
 ROSASM = r"F:\RISCOSDEV\rosasm\target\release\rosasm.exe"
 AOFDUMP = ROSASM.replace("rosasm.exe", "aofdump.exe")
-PD = [f'{k} SETS "{v}"' for k, v in BUILD_VARS]
+# Filled from the build's own environment file once the export tree is built.
+PD = []
 
 
 def classify(err):
@@ -58,7 +60,9 @@ UNHANDLED_RELOC = re.compile(r"unhandled relocation type (\d+)")
 def assemble(unit):
     """Run the whole pipeline on one unit. Returns a result dict."""
     comp = os.path.dirname(os.path.dirname(unit))
-    args = [ROSASM, unit, "-I", comp, "-I", os.path.join(comp, "hdr"), "-I", HDRROOT[0]]
+    args = [ROSASM, unit, "-I", comp, "-I", os.path.join(comp, "hdr")]
+    for d in HDRROOT[0]:
+        args += ["-I", d]
     for pd in PD:
         args += ["-PD", pd]
     with tempfile.TemporaryDirectory() as tmp:
@@ -104,15 +108,23 @@ HDRROOT = [None]
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
+    ap.add_argument("--build", default="BCM2835")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--out")
     a = ap.parse_args()
 
-    # The emulator's disc is not involved here, so the export root goes
-    # somewhere local rather than into hostfs.
-    corpus_diff.HDRROOT = os.path.join(tempfile.gettempdir(), "rosasm-hdrs")
-    HDRROOT[0] = corpus_diff.build_export_root(a.root)
+    # The emulator's disc is not involved here, so the export tree goes
+    # somewhere local rather than into hostfs. This is the build's export_hdrs
+    # phase: an explicit list of headers into Global and Interface, not a union
+    # of every hdr/ directory.
+    variables, HDRROOT[0] = export_hdrs(
+        a.root, os.path.join(tempfile.gettempdir(), "rosasm-export"), a.build
+    )
+    in_build = components(a.root, a.build)
+    # Every one of them, because the headers name several in filenames --
+    # `Hdr:HALSize.<HALSize>` cannot be found without knowing HALSize is 64K.
+    PD[:] = [f'{k} SETS "{v}"' for k, v in sorted(variables.items())]
     us = units(a.root)
     if a.limit:
         us = us[: a.limit]
@@ -149,6 +161,22 @@ def main():
         lines.append("relocation types not translated:")
         for m, n in relocs.most_common(20):
             lines.append(f"  {n:5d}  ELF type {m}")
+
+    # A unit whose component this build does not contain was never going to
+    # assemble: nothing exported the headers it wants.
+    outside = [
+        r
+        for r in results
+        if not r["ok"]
+        and in_build
+        and not (set(r["unit"].replace("\\", "/").split("/")) & in_build)
+    ]
+    if outside:
+        lines.append("")
+        lines.append(
+            f"of the {len(results) - len(ok)} failures, {len(outside)} are components "
+            f"this build does not contain"
+        )
 
     failed = collections.Counter(r["why"] for r in results if not r["ok"])
     if failed:
