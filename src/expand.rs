@@ -528,19 +528,43 @@ pub fn immediate(v: u32) -> String {
 pub fn identifiers(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    for c in s.chars() {
+    // An operator is written between colons -- `:EOR:`, `:SHL:`, `:LNOT:` --
+    // and the word inside one is not a name. Reading it as one made `DCD
+    // &1A000000 :EOR: Cond_NE` ask the linker to relocate against a symbol
+    // called EOR.
+    let mut in_operator = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' {
+            if !cur.is_empty() && !in_operator {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.clear();
+            in_operator = !in_operator;
+            continue;
+        }
         if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
             cur.push(c);
         } else if !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
+            let t = std::mem::take(&mut cur);
+            if !in_operator {
+                out.push(t);
+            }
         }
     }
-    if !cur.is_empty() {
+    if !cur.is_empty() && !in_operator {
         out.push(cur);
     }
     // A leading digit means a number, not a name.
     out.retain(|t| !t.starts_with(|c: char| c.is_ascii_digit()));
     out
+}
+
+/// Where a data line stands, for the `.` and the local labels in its items.
+struct DataSite {
+    addr: u32,
+    area: usize,
+    rout: Option<String>,
 }
 
 /// One local label definition: `10loop` or a bare `10`.
@@ -1997,7 +2021,12 @@ impl<'a> Expander<'a> {
                 op.to_ascii_uppercase().as_str(),
                 "DCD" | "DCB" | "DCW" | "DCQ" | "DCI" | "&" | "="
             ) {
-                let (bytes, holes) = self.data_bytes_with_holes(&relexed);
+                let site = DataSite {
+                    addr: l.addr,
+                    area: l.area_index,
+                    rout: l.rout.clone(),
+                };
+                let (bytes, holes) = self.data_bytes_with_holes(&relexed, Some(&site));
                 l.bytes = bytes;
                 for (off, width, expr, resolved) in holes {
                     // A value that evaluated is still not final if it came
@@ -2009,7 +2038,15 @@ impl<'a> Expander<'a> {
                             .filter_map(|n| self.label_defs.get(n).map(|(a, _)| *a))
                             .collect();
                         match areas.first() {
-                            Some(a) if areas.iter().all(|x| x == a) => FixupKind::AreaBase(*a),
+                            // Only if the value moves when the area does:
+                            // `Initialise - Module_BaseAddr` is a distance
+                            // and stays the same wherever the area lands.
+                            Some(a) if areas.iter().all(|x| x == a) => {
+                                if !self.moves_with_area(&expr, *a) {
+                                    continue;
+                                }
+                                FixupKind::AreaBase(*a)
+                            }
                             Some(_) => {
                                 eprintln!(
                                     "rosasm: {}:{}: `{expr}` spans more than one area",
@@ -2024,10 +2061,13 @@ impl<'a> Expander<'a> {
                         // it was written as: `DCD |Image$$RO$$Base|`
                         // asks for `Image$$RO$$Base`, and the bars are
                         // delimiters that no symbol table carries.
+                        // Only a name the object actually imports. Taking
+                        // the first identifier when none is imported invents
+                        // a relocation against a macro's own variable, which
+                        // no linker can match and no listing explains.
                         match identifiers(&expr)
                             .into_iter()
                             .find(|n| self.imports.contains(n))
-                            .or_else(|| identifiers(&expr).into_iter().next())
                         {
                             Some(n) => FixupKind::External(n),
                             None => continue,
@@ -2446,7 +2486,7 @@ impl<'a> Expander<'a> {
     /// a relocation — contributes zero bytes as a placeholder, and the width is
     /// still accounted for by the caller's sizing.
     fn data_bytes(&self, line: &Line) -> Vec<u8> {
-        self.data_bytes_with_holes(line).0
+        self.data_bytes_with_holes(line, None).0
     }
 
     /// As `data_bytes`, also reporting every item that names something rather
@@ -2454,7 +2494,11 @@ impl<'a> Expander<'a> {
     /// operand text, did it evaluate)`. An item that evaluated may still need
     /// relocating, because a label's value is an offset into an area.
     #[allow(clippy::type_complexity)]
-    fn data_bytes_with_holes(&self, line: &Line) -> (Vec<u8>, Vec<(u32, u8, String, bool)>) {
+    fn data_bytes_with_holes(
+        &self,
+        line: &Line,
+        at: Option<&DataSite>,
+    ) -> (Vec<u8>, Vec<(u32, u8, String, bool)>) {
         let Some(op) = line.opcode_str() else { return (Vec::new(), Vec::new()) };
         let up = op.to_ascii_uppercase();
         let width = match up.as_str() {
@@ -2487,6 +2531,20 @@ impl<'a> Expander<'a> {
                 }
                 continue;
             }
+            // `.` in a data item is the address of the line it is on, and a
+            // local label reference needs its scope -- the same treatment an
+            // instruction's operands get. DADebug builds a branch word by
+            // hand: `DCD &1A000000 :EOR: Cond_NE + ((%FT01 - (. + 8))/4)`.
+            let owned;
+            let t: &str = match at {
+                Some(site) => {
+                    let s =
+                        self.substitute_locals(t, site.addr, site.area, site.rout.as_deref());
+                    owned = Self::substitute_dot(&s, site.addr);
+                    &owned
+                }
+                None => t,
+            };
             let v = match self.eval_expr(t) {
                 Ok(Value::Arith(n)) => {
                     if !identifiers(t).is_empty() {
@@ -2667,6 +2725,67 @@ impl<'a> Expander<'a> {
         Ok(bytes)
     }
 
+    /// Does this value move when the linker places the area?
+    ///
+    /// `DCD Initialise - Module_BaseAddr` names two labels and moves with
+    /// neither: the distance between them is the same wherever the area
+    /// lands, and ObjAsm emits no relocation for it. `DCD Initialise` moves
+    /// with the area and needs one. DADebug's module header is seventeen of
+    /// the first kind, one after another.
+    ///
+    /// Rather than pick the expression apart, it is asked: evaluated as it
+    /// stands, and again with every label in that area moved along. A value
+    /// that moved with them moves with the area. Anything that will not
+    /// evaluate either way is left to be relocated, which is the safe answer.
+    fn moves_with_area(&self, expr: &str, area: usize) -> bool {
+        const BY: u32 = 4;
+        let Ok(Value::Arith(a)) = self.eval_expr(expr) else {
+            return true;
+        };
+        let shifted = self.shift_labels(expr, area, BY);
+        let Ok(Value::Arith(b)) = self.eval_expr(&shifted) else {
+            return true;
+        };
+        b.wrapping_sub(a) != 0
+    }
+
+    /// The expression with every label of one area moved along by `by`.
+    fn shift_labels(&self, text: &str, area: usize, by: u32) -> String {
+        let cs: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len() + 16);
+        let mut i = 0;
+        while i < cs.len() {
+            // A quoted string is not an expression.
+            if cs[i] == '"' {
+                out.push(cs[i]);
+                i += 1;
+                while i < cs.len() {
+                    out.push(cs[i]);
+                    i += 1;
+                    if cs[i - 1] == '"' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if !(cs[i].is_alphabetic() || cs[i] == '_') {
+                out.push(cs[i]);
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < cs.len() && (cs[i].is_alphanumeric() || "_$".contains(cs[i])) {
+                i += 1;
+            }
+            let name: String = cs[start..i].iter().collect();
+            match self.label_defs.get(&name) {
+                Some((a, _)) if *a == area => out.push_str(&format!("({name}+{by})")),
+                _ => out.push_str(&name),
+            }
+        }
+        out
+    }
+
     /// How a value naming a symbol has to be relocated, if at all.
     fn fixup_kind(&self, expr: &str) -> Option<FixupKind> {
         let names = identifiers(expr);
@@ -2675,7 +2794,10 @@ impl<'a> Expander<'a> {
             .filter_map(|n| self.label_defs.get(n).map(|(a, _)| *a))
             .collect();
         if let Some(a) = areas.first() {
-            return areas.iter().all(|x| x == a).then_some(FixupKind::AreaBase(*a));
+            if !areas.iter().all(|x| x == a) {
+                return None;
+            }
+            return self.moves_with_area(expr, *a).then_some(FixupKind::AreaBase(*a));
         }
         names
             .iter()
