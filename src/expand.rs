@@ -341,6 +341,10 @@ pub struct Expander<'a> {
     /// FPA register names declared with `FN`. `FACC FN 0` is `f0`, and the
     /// maths sources name their working registers this way throughout.
     fpa_aliases: std::collections::HashMap<String, u32>,
+    /// Coprocessor names, from `CP` (the coprocessor itself, `p15`) and `CN`
+    /// (one of its registers, `c1`). The Kernel talks to CP15 entirely through
+    /// these: `ARM_config_cp CP 15` and `ARM_control_reg CN 1`.
+    cp_aliases: std::collections::HashMap<String, (char, u32)>,
     /// The base register the current `MAP` established, if it named one.
     map_base: Option<u32>,
     /// Symbols a `FIELD` defined under such a `MAP`, and the register they are
@@ -550,7 +554,8 @@ fn is_zero_size(up: &str) -> bool {
         up,
         "EXPORT" | "IMPORT" | "EXTERN" | "GLOBAL" | "KEEP" | "ENTRY" | "DATA"
             | "ARM" | "CODE32" | "REQUIRE" | "EXPORTAS" | "STRONG" | "RN" | "CN" | "FN"
-            | "DN" | "SN" | "NOFP" | "OPT" | "TTL" | "SUBT" | "ALIGN" | "!" | "INFO"
+            | "DN" | "SN" | "CP" | "NOFP" | "OPT" | "TTL" | "SUBT" | "ALIGN" | "!"
+            | "INFO"
     )
 }
 
@@ -598,6 +603,7 @@ impl<'a> Expander<'a> {
             reg_aliases: std::collections::HashMap::new(),
             vfp_aliases: std::collections::HashMap::new(),
             fpa_aliases: std::collections::HashMap::new(),
+            cp_aliases: std::collections::HashMap::new(),
             map_base: None,
             field_bases: std::collections::HashMap::new(),
             pending_literals: Vec::new(),
@@ -962,15 +968,11 @@ impl<'a> Expander<'a> {
     /// would rather do ourselves. A label elsewhere keeps its name and becomes
     /// a relocation directive.
     fn resolve_name(&self, word: &str, line: &ExpandedLine) -> Option<String> {
-        if let Some((a, t)) = self.label_defs.get(word) {
-            if *a == line.area_index {
-                let d = *t as i64 - line.addr as i64;
-                return Some(if d < 0 {
-                    format!(".-{}", -d)
-                } else {
-                    format!(".+{d}")
-                });
-            }
+        // A label is not folded here. Where it stands for an address it is
+        // one term of an expression -- `B SLVK + SWIRelocation` -- and
+        // rewriting the term alone would leave the rest measured from
+        // somewhere else. `fold_address` takes the expression whole.
+        if self.label_defs.contains_key(word) {
             return None;
         }
         if let Some(n) = self.reg_aliases.get(word) {
@@ -987,6 +989,9 @@ impl<'a> Expander<'a> {
             // FPA translation knows.
             return Some(format!("f{n}"));
         }
+        if let Some((kind, n)) = self.cp_aliases.get(word) {
+            return Some(format!("{kind}{n}"));
+        }
         None
     }
 
@@ -997,12 +1002,59 @@ impl<'a> Expander<'a> {
     /// before evaluation, in the places where the location is known -- which
     /// is how `ASSERT . - %BT01 = ...` can be checked at all, and the Kernel
     /// checks its ARM operation tables that way.
-    fn substitute_locals(&self, text: &str, here: u32) -> String {
+    /// Replace the location counter with this line's own address.
+    ///
+    /// `.` reads as where the assembler is, and the symbol table's copy holds
+    /// wherever it finished -- fine while a line is being expanded, useless
+    /// afterwards. An operand like `#(NaffSWI - (.+12))/4` is measured from
+    /// the instruction that carries it, so the address is put in first.
+    ///
+    /// A `.` inside a number is left alone, which is what keeps `#0.5` a half
+    /// rather than an address.
+    fn substitute_dot(text: &str, here: u32) -> String {
+        if !text.contains('.') {
+            return text.to_string();
+        }
+        let part_of_name = |j: Option<&char>| {
+            j.is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+        };
+        let cs: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < cs.len() {
+            // A dot inside a string is a full stop: `MOV r0,#"."` asks for the
+            // character, not for where the assembler has got to.
+            if cs[i] == '"' || cs[i] == '\'' {
+                let quote = cs[i];
+                out.push(cs[i]);
+                i += 1;
+                while i < cs.len() {
+                    out.push(cs[i]);
+                    i += 1;
+                    if cs[i - 1] == quote {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if cs[i] == '.'
+                && !part_of_name(cs.get(i.wrapping_sub(1)))
+                && !part_of_name(cs.get(i + 1))
+            {
+                out.push_str(&here.to_string());
+            } else {
+                out.push(cs[i]);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn substitute_locals(&self, text: &str, here: u32, area: usize, rout: Option<&str>) -> String {
         if !text.contains('%') {
             return text.to_string();
         }
-        let area = self.current_area_index();
-        let rout = self.rout.clone();
+        let rout = rout.map(str::to_string);
         let cs: Vec<char> = text.chars().collect();
         let mut out = String::with_capacity(text.len());
         let mut i = 0;
@@ -1026,6 +1078,50 @@ impl<'a> Expander<'a> {
         out
     }
 
+    /// Fold an operand that names an address into an offset from `.`.
+    ///
+    /// A branch or a literal load takes one address, written as an expression
+    /// that may be a bare label or may be built from one: `B SLVK`, but also
+    /// `B callback_checking + SWIRelocation` and `LDR r0, Table`. The distance
+    /// to it from here is fixed, so the whole expression is worked out once
+    /// and becomes a single offset -- which is both what the encoder will take
+    /// and what saves it a relocation it could not resolve anyway.
+    ///
+    /// Only when every label in the expression is in this same area. One
+    /// elsewhere has no fixed distance from here, so the name is left for the
+    /// linker.
+    fn fold_address(&self, group: &str, line: &ExpandedLine) -> Option<String> {
+        let t = group.trim();
+        // An address, not an immediate, a register list or an addressing mode.
+        if t.is_empty() || t.starts_with(['#', '[', '{', '=', '"']) {
+            return None;
+        }
+        let names = identifiers(t);
+        if !names.iter().any(|n| self.label_defs.contains_key(n)) {
+            return None;
+        }
+        if names
+            .iter()
+            .filter_map(|n| self.label_defs.get(n))
+            .any(|(a, _)| *a != line.area_index)
+        {
+            return None;
+        }
+        let text = self.substitute_locals(t, line.addr, line.area_index, line.rout.as_deref());
+        let text = Self::substitute_dot(&text, line.addr);
+        match expr::eval(&text, &self.syms) {
+            Ok(Value::Arith(v)) => {
+                let d = v as i64 - line.addr as i64;
+                Some(if d < 0 {
+                    format!(".-{}", -d)
+                } else {
+                    format!(".+{d}")
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Rewrite an instruction's operands into something the encoder can parse.
     ///
     /// This is where the division of labour is enforced: ObjAsm's expression
@@ -1041,6 +1137,18 @@ impl<'a> Expander<'a> {
     /// An expression that will not evaluate is left alone, so the encoder's
     /// complaint names the symbol that is actually missing.
     pub fn encoder_operands(&self, line: &ExpandedLine, operands: &str) -> String {
+        // The address an instruction refers to is always its last operand, and
+        // is folded whole before anything else looks at the text.
+        let groups = layout::split_top_level(operands);
+        let operands = match groups.last().and_then(|g| self.fold_address(g, line)) {
+            Some(folded) => {
+                let mut v: Vec<String> = groups[..groups.len() - 1].to_vec();
+                v.push(folded);
+                v.join(",")
+            }
+            None => operands.to_string(),
+        };
+        let operands: &str = &operands;
         let cs: Vec<char> = operands.chars().collect();
         let mut out = String::with_capacity(operands.len());
         let mut i = 0;
@@ -1099,6 +1207,15 @@ impl<'a> Expander<'a> {
                     let mut depth = 0i32;
                     while i < cs.len() {
                         match cs[i] {
+                            // A comma inside a string is part of it, not a
+                            // separator: `SWI XOS_WriteI+","` is one operand.
+                            '"' | '\'' => {
+                                let quote = cs[i];
+                                i += 1;
+                                while i < cs.len() && cs[i] != quote {
+                                    i += 1;
+                                }
+                            }
                             '(' | '[' | '{' => depth += 1,
                             ')' | '}' => depth -= 1,
                             // A closing bracket at the top level ends the
@@ -1111,12 +1228,45 @@ impl<'a> Expander<'a> {
                         i += 1;
                     }
                     let text: String = cs[start..i].iter().collect();
+                    // `#(%30-%10):SHR:2` measures the distance between two
+                    // local labels, so they have to become numbers before the
+                    // evaluator sees them.
+                    let text = self.substitute_locals(
+                        &text,
+                        line.addr,
+                        line.area_index,
+                        line.rout.as_deref(),
+                    );
+                    let text = Self::substitute_dot(&text, line.addr);
+                    // ARM's immediate is eight bits rotated by an even
+                    // amount, and ObjAsm lets the two be written separately:
+                    // `AND lr, lr, #all,wanted` is `all` rotated right by
+                    // `wanted`. It is always the last operand, and the
+                    // rotation is even and under 32, which is what tells it
+                    // apart from an operand that merely follows.
+                    let mut rotation = None;
+                    if lead == '#' && i < cs.len() && cs[i] == ',' {
+                        let rest: String = cs[i + 1..].iter().collect();
+                        if !rest.contains(',') {
+                            if let Some(r) = self.eval_immediate(rest.trim()) {
+                                if r < 32 && r % 2 == 0 {
+                                    rotation = Some(r);
+                                    i = cs.len();
+                                }
+                            }
+                        }
+                    }
                     match self.eval_immediate(text.trim()) {
                         // `=` introduces a 32-bit pattern to be loaded, so it
                         // is written unsigned; `#` is often an addressing
                         // offset, where the sign is what makes it legal.
                         Some(n) if lead == '=' => out.push_str(&format!("={n:#X}")),
-                        Some(n) => out.push_str(&format!("{lead}{}", immediate(n))),
+                        Some(n) => {
+                            out.push_str(&format!("{lead}{}", immediate(n)));
+                            if let Some(r) = rotation {
+                                out.push_str(&format!(", {r}"));
+                            }
+                        }
                         None => {
                             out.push(lead);
                             out.push_str(&text);
@@ -1445,7 +1595,7 @@ impl<'a> Expander<'a> {
             // "still permits register names in expressions (they are
             // automatically converted to the register number)", which is why
             // `ASSERT Rregno <> OP1sue` in regnames/s works at all.
-            "RN" | "CN" | "FN" | "DN" | "SN" => self.do_regname(&line)?,
+            "RN" | "CN" | "FN" | "DN" | "SN" | "CP" => self.do_regname(&line)?,
             "ASSERT" => self.do_assert(&line)?,
             // Listing only. The manual's OPT table is entirely about what
             // appears in the listing — page throws, line numbering, whether
@@ -1509,8 +1659,8 @@ impl<'a> Expander<'a> {
                 | "MACRO" | "WHILE" | "WEND" | "MEXIT" | "MEND" | "GBLA" | "GBLL" | "GBLS"
                 | "LCLA" | "LCLL" | "LCLS" | "SETA" | "SETL" | "SETS" | "END"
                 | "*" | "EQU" | "^" | "MAP" | "#" | "FIELD" | "ROUT" | "AREA"
-                | "RN" | "CN" | "FN" | "DN" | "SN" | "ASSERT" | "OPT" | "TTL" | "SUBT"
-                | "NOFP" | "!" | "INFO"
+                | "RN" | "CN" | "FN" | "DN" | "SN" | "CP" | "ASSERT" | "OPT" | "TTL"
+                | "SUBT" | "NOFP" | "!" | "INFO"
         )
     }
 
@@ -1804,8 +1954,12 @@ impl<'a> Expander<'a> {
                     "FN" => {
                         self.fpa_aliases.insert(name, n);
                     }
-                    // A coprocessor register number is not an ARM register
-                    // and must not be substituted as one.
+                    "CP" => {
+                        self.cp_aliases.insert(name, ('p', n));
+                    }
+                    "CN" => {
+                        self.cp_aliases.insert(name, ('c', n));
+                    }
                     _ => {}
                 }
                 Ok(())
@@ -1998,7 +2152,7 @@ impl<'a> Expander<'a> {
             // Directives that emit nothing.
             "EXPORT" | "IMPORT" | "EXTERN" | "GLOBAL" | "KEEP" | "ENTRY" | "DATA"
             | "ARM" | "CODE32" | "REQUIRE" | "EXPORTAS" | "STRONG" | "RN" | "CN" | "FN"
-            | "DN" | "SN" | "NOFP" | "OPT" | "TTL" | "SUBT" => {}
+            | "DN" | "SN" | "CP" | "NOFP" | "OPT" | "TTL" | "SUBT" => {}
             // `LTORG` puts the pool here, word aligned. Its size is whatever
             // the literals asked for since the last one.
             "LTORG" => {
@@ -2313,7 +2467,9 @@ impl<'a> Expander<'a> {
         }
         let here = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
         let src = self.expand_text(line.operands_str().unwrap_or(""));
-        let src = self.substitute_locals(&src, here);
+        let area = self.current_area_index();
+        let rout = self.rout.clone();
+        let src = self.substitute_locals(&src, here, area, rout.as_deref());
         match expr::eval(&src, &self.syms) {
             Ok(Value::Logical(true)) => Ok(()),
             Ok(Value::Logical(false)) => {
@@ -2540,10 +2696,17 @@ impl<'a> Expander<'a> {
             return Some((i, None));
         }
         // Longest stem wins, so `PTOpX$cc` beats `PTOp$cc` for `PTOpXEQ`.
+        //
+        // The argument may be empty, and often is: `BPIALL$cond` is invoked as
+        // a bare `BPIALL` far more often than with a condition. Requiring the
+        // invocation to be longer than the stem lost both -- a plain `BPIALL`
+        // matched nothing and reached the encoder as an instruction, and
+        // `BPIALLIS` matched `BPIALL` with `$cond` as `IS`, so the body's
+        // `MCR$cond` came out as `MCRIS`.
         let mut best: Option<(usize, Option<String>)> = None;
         let mut best_len = 0usize;
         for (i, m) in self.macros.iter().enumerate() {
-            if m.name_param.is_some() && op.len() > m.stem.len() && op.starts_with(&m.stem) {
+            if m.name_param.is_some() && op.len() >= m.stem.len() && op.starts_with(&m.stem) {
                 if m.stem.len() >= best_len {
                     best_len = m.stem.len();
                     best = Some((i, Some(op[m.stem.len()..].to_string())));

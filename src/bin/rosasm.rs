@@ -427,13 +427,13 @@ fn main() {
     // how the Kernel's `ASSERT {PC}-SVCDespatcher = SWIDespatch_Size` gets
     // tracked down: the first address that differs is the line that did it.
     if let Some(path) = &map {
-        let mut out = String::from("; address  area  file:line  source\n");
-        for l in &lines {
+        let mut out = String::from("; index  address  area  file:line  source\n");
+        for (i, l) in lines.iter().enumerate() {
             if l.listing_only {
                 continue;
             }
             out.push_str(&format!(
-                "{:08X} {:>3}  {}:{}  {}\n",
+                "{i:<6} {:08X} {:>3}  {}:{}  {}\n",
                 l.addr,
                 l.area_index,
                 l.origin.file,

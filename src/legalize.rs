@@ -259,6 +259,27 @@ pub fn legalize(mnemonic: &str, operands: &str, ctx: &Context) -> Legalized {
         }
     }
 
+    // A coprocessor transfer, written the way ObjAsm allows and UAL does not.
+    // `MRC p14,0,pc,c14,c0` reads the coprocessor into the flags, which UAL
+    // spells `apsr_nzcv`, and the final operand may be left off when it is
+    // zero.
+    if (up.starts_with("MRC") || up.starts_with("MCR")) && !up.starts_with("MRRC")
+        && !up.starts_with("MCRR")
+    {
+        let mut parts: Vec<String> = operands
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.len() >= 3 && up.starts_with("MRC") && parts[2].eq_ignore_ascii_case("pc") {
+            parts[2] = "apsr_nzcv".into();
+        }
+        if parts.len() == 5 {
+            parts.push("0".into());
+        }
+        return Legalized::One(up, parts.join(", "));
+    }
+
     if lower::is_psr_form(&up) {
         return Legalized::Unsupported(format!(
             "{up} writes the PSR in 26-bit mode and has no 32-bit form"
