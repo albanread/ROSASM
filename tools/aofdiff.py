@@ -229,9 +229,11 @@ def objasm(sh, unit, predefines, extra_i, variables, hdrdirs):
     # the offending listing line before each error, so a unit with twenty
     # errors says four times more than a terminal holds, and the one line
     # that explains the run is always the first.
-    log = os.path.join(STAGE, "log")
-    if os.path.isfile(log):
-        os.unlink(log)
+    # HostFS spells a file's type as a suffix, so the log is `log,ffd`.
+    logs = [os.path.join(STAGE, "log" + x) for x in (",ffd", "")]
+    for p in logs:
+        if os.path.isfile(p):
+            os.unlink(p)
     # What the build gives it, from BuildSys/Makefiles/StdTools:
     #
     #     ASFLAGS += -ihdr -i<Hdr$Dir>.Global -i<Hdr$Dir>.Interface     #                -i<Hdr$Dir>.Interface2
@@ -244,22 +246,37 @@ def objasm(sh, unit, predefines, extra_i, variables, hdrdirs):
         f" -i {root}.{HDR_NAME}.{os.path.basename(d)}" for d in hdrdirs
     )
     cmd = (
-        f"Run {OBJASM} -via via -o o.{name}"
+        # `-quit` because the build passes it: BuildSys documents ASFLAGS as
+        # `-Stamp -quit ...`, and without it ObjAsm can finish its work and
+        # still not return -- VFPSupport's Power32 wrote `0 Errors, 165
+        # Warnings` and then sat there, object unwritten, until the harness
+        # gave up and called it wedged.
+        f"Run {OBJASM} -quit -via via -o o.{name}"
         f"{includes}{extra_i} s.{name}"
         " { > log }"
     )
     # The output is redirected, so nothing reaches the screen until the
     # prompt comes back; quiescence means nothing here.
-    screen = sh.cmd(cmd, settle=1.0, max_wait=120.0, require_prompt=True)
+    # The log getting longer is ObjAsm working, so the wait follows that
+    # rather than a clock: VFPSupport's Power32 warns about every VFP
+    # instruction it has and takes ten minutes to say so.
+    def written():
+        return tuple(os.path.getsize(p) if os.path.isfile(p) else -1 for p in logs)
+
+    screen = sh.cmd(
+        cmd, settle=1.0, max_wait=90.0, require_prompt=True, progress=written
+    )
     out = screen
     deadline = time.time() + 5.0
-    while not os.path.isfile(log) and time.time() < deadline:
+    while not any(os.path.isfile(p) for p in logs) and time.time() < deadline:
         time.sleep(0.2)
-    if os.path.isfile(log):
-        try:
-            out = open(log, "rb").read().decode("latin-1").replace("\r", "\n")
-        except OSError:
-            pass
+    for p in logs:
+        if os.path.isfile(p):
+            try:
+                out = open(p, "rb").read().decode("latin-1").replace("\r", "\n")
+            except OSError:
+                pass
+            break
     # HostFS buffers: wait for Windows to see the file.
     for suffix in (",ffd", ""):
         path = os.path.join(STAGE, "o", name + suffix)

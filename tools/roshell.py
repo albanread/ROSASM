@@ -164,7 +164,8 @@ class Shell:
 
     # ---- commands --------------------------------------------------------
 
-    def cmd(self, command, settle=2.0, max_wait=120.0, require_prompt=False):
+    def cmd(self, command, settle=2.0, max_wait=120.0, require_prompt=False,
+            progress=None):
         """Type a command, wait for the prompt to come back, return its output.
 
         Two quirks of the keyboard injection are worked around here. The first
@@ -179,8 +180,17 @@ class Shell:
         t0 = time.time()
         last = ""
         stable = 0.0
+        # `max_wait` bounds how long the emulator may be *idle*, not how long
+        # the command may take. A caller that can see the command working --
+        # a log file getting longer -- says so here, and a unit that takes
+        # ten minutes of emulation is not mistaken for one that has stopped.
+        moved = progress() if progress else None
         while time.time() - t0 < max_wait:
             time.sleep(0.5)
+            if progress:
+                now = progress()
+                if now != moved:
+                    moved, t0, stable = now, time.time(), 0.0
             text = self.call("vdu.read").get("text", "")[base:]
             if text == last:
                 stable += 0.5
