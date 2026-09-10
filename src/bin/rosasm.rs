@@ -664,7 +664,16 @@ fn main() {
             .get(r.sym as usize)
             .map(|s| s.name.clone())
             .unwrap_or_default();
-        if name.starts_with("__ros") {
+        // Only a symbol the encoder could not resolve becomes a relocation.
+        // A `b .+20` is resolved where it stands, and LLVM still records a
+        // fixup against a temporary of its own -- `.L0` -- which is already
+        // accounted for in the bytes. Re-applying it corrupts the branch, and
+        // puts a symbol in the object that names nothing.
+        let defined = elf
+            .symbols
+            .get(r.sym as usize)
+            .is_some_and(|s| s.is_defined());
+        if defined || name.starts_with("__ros") || name.starts_with(".L") {
             continue;
         }
         let here = seg.dest + (r.offset - seg.text.start as u32);
