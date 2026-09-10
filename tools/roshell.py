@@ -22,6 +22,68 @@ EMU = os.path.join(CWD, "rpcemu-headless.exe")
 SNAP = os.path.join(CWD, "rosasm-boot.snap")
 
 
+LOCK = ".roshell-lock"
+# Directories this process is already driving. The lock file catches another
+# process; this catches a second `Shell` here, which is the easier mistake.
+HELD = set()
+
+
+def claim(cwd):
+    """Take the instance directory, or say who has it.
+
+    Two emulators sharing one HostFS tree each delete the staging the other
+    is assembling from and read objects the other has just removed. Nothing
+    errors: units come back with no object and an empty log, which reads
+    exactly like ObjAsm refusing them, and thirty units of a collection went
+    that way before anyone noticed the second window.
+
+    A farm of instances is fine -- that is what `cwd` is for -- as long as
+    each has a directory of its own, which is what this checks.
+    """
+    key = os.path.normcase(os.path.abspath(cwd))
+    if key in HELD:
+        raise RuntimeError(
+            f"this process is already driving the emulator in {cwd}; close "
+            "that Shell before opening another"
+        )
+    path = os.path.join(cwd, LOCK)
+    try:
+        with open(path) as f:
+            held = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        held = 0
+    if held and held != os.getpid() and alive(held):
+        raise RuntimeError(
+            f"process {held} is already driving the emulator in {cwd}; stop "
+            "it first -- two instances share one HostFS tree and would "
+            "quietly corrupt each other's staging"
+        )
+    with open(path, "w") as f:
+        f.write(str(os.getpid()))
+    HELD.add(key)
+    return path
+
+
+def alive(pid):
+    """Is that process still running? A stale lock must not block a run."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return str(pid) in out
+
+
+def release(cwd):
+    HELD.discard(os.path.normcase(os.path.abspath(cwd)))
+    try:
+        os.unlink(os.path.join(cwd, LOCK))
+    except OSError:
+        pass
+
+
 class Shell:
     def __init__(self, quiet=True, cwd=None):
         """`cwd` selects which emulator instance to drive, so a farm of copied
@@ -29,6 +91,7 @@ class Shell:
         writes cmos.ram on exit, and two instances sharing one would race."""
         self.quiet = quiet
         self.cwd = cwd or CWD
+        self.lock = claim(self.cwd)
         self.p = subprocess.Popen(
             [os.path.join(self.cwd, "rpcemu-headless.exe"), "--rpc"], cwd=self.cwd,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -118,6 +181,11 @@ class Shell:
             self.p.wait(timeout=10)
         except Exception:
             self.p.kill()
+        # Killed rather than left: an instance that outlives its driver is
+        # what the lock exists to catch, and it should not need catching.
+        if self.p.poll() is None:
+            self.p.kill()
+        release(self.cwd)
 
 
 def main():
