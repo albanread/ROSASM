@@ -96,14 +96,20 @@ def _rm(path):
 
 
 def stage_headers(hdrdirs):
-    """Put the export tree where the emulator can reach it, once."""
-    if os.path.isdir(HDRSTAGE):
-        return
+    """Put the export tree where the emulator can reach it, once.
+
+    Per directory rather than per tree: an earlier harness staged the headers
+    flat, and skipping the whole job because the parent already existed left
+    that tree in place with no `Global` in it for `Hdr$Path` to point at.
+    Every header lookup then failed, silently, as an unknown opcode wherever
+    a macro should have been.
+    """
     for d in hdrdirs:
         leaf = os.path.basename(d)
         dest = os.path.join(HDRSTAGE, leaf)
-        if os.path.isdir(d):
-            shutil.copytree(d, dest, dirs_exist_ok=True)
+        if os.path.isdir(dest) or not os.path.isdir(d):
+            continue
+        shutil.copytree(d, dest, dirs_exist_ok=True)
 
 
 def stage_unit(unit, generated):
@@ -235,7 +241,7 @@ class Setup:
         return pds, generated
 
 
-def compare_one(setup, sh, unit, limit, keep):
+def compare_one(setup, sh, unit, limit, keep, full=False):
     """Assemble one unit both ways. Returns (verdict, detail).
 
     The verdict is one of `same`, `differ`, `objasm-failed`, `ours-failed`.
@@ -266,11 +272,11 @@ def compare_one(setup, sh, unit, limit, keep):
     return ("same" if d.returncode == 0 else "differ"), d.stdout.strip()
 
 
-def one(root, unit, build, keep, limit):
+def one(root, unit, build, keep, limit, full=False):
     setup = Setup(root, build)
     sh = Shell(quiet=True)
     sh.boot()
-    verdict, detail = compare_one(setup, sh, unit, limit, keep)
+    verdict, detail = compare_one(setup, sh, unit, limit, keep, full)
     try:
         sh.close()
     except Exception:
@@ -358,12 +364,13 @@ def main():
     ap.add_argument("--out", help="write the per-unit verdicts here")
     ap.add_argument("--keep", action="store_true", help="leave the staged files")
     ap.add_argument("-n", type=int, default=12, help="differing words to show")
+    ap.add_argument("--full", action="store_true", help="print ObjAsm's whole log")
     a = ap.parse_args()
     if a.all:
         raise SystemExit(many(a.root, a.build, a.n, a.limit, a.out))
     if not a.unit:
         raise SystemExit("give a unit to compare, or --all")
-    raise SystemExit(one(a.root, a.unit, a.build, a.keep, a.n))
+    raise SystemExit(one(a.root, a.unit, a.build, a.keep, a.n, a.full))
 
 
 if __name__ == "__main__":

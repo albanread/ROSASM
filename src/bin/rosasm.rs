@@ -42,8 +42,26 @@ struct Dirs {
 /// RISC OS writes `dir.file`, but the sources also write `file.dir` — the DDE
 /// resolves both, which is what lets one tree be read from a RISC OS or a
 /// Unix-style host.
+///
+/// A name carrying a host separator is read as a host path and nothing else:
+/// `GET ../VersionASM` and `GET ../../kernel/k_atomic.s` mean what they say,
+/// and turning their dots into separators would make nonsense of them. The
+/// type still moves, because `kernel/k_atomic.s` is `kernel.s.k_atomic`
+/// however it is spelt.
 fn relative_forms(name: &str) -> Vec<String> {
     let name = name.trim();
+    if name.contains('/') || name.contains('\\') {
+        let n = name.replace('\\', "/");
+        let mut out = vec![n.clone()];
+        if let Some((head, tail)) = n.rsplit_once('.') {
+            if !tail.contains('/') {
+                if let Some((dir, leaf)) = head.rsplit_once('/') {
+                    out.push(format!("{dir}/{tail}/{leaf}"));
+                }
+            }
+        }
+        return out.into_iter().map(|f| parents(&f)).collect();
+    }
     let mut out = vec![name.replace('.', "/")];
     if let Some((head, tail)) = name.rsplit_once('.') {
         let head = head.replace('.', "/");
@@ -62,7 +80,20 @@ fn relative_forms(name: &str) -> Vec<String> {
             out.push(nested);
         }
     }
-    out
+    out.into_iter().map(|f| parents(&f)).collect()
+}
+
+/// `^` is RISC OS for the directory above, and the sources reach out of a
+/// component with it: `GET ^.^.s.HeapMan` from `Kernel/Dev/HeapTest` is
+/// `Kernel/s/HeapMan`.
+fn parents(path: &str) -> String {
+    if !path.contains('^') {
+        return path.to_string();
+    }
+    path.split('/')
+        .map(|p| if p == "^" { ".." } else { p })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 impl FileResolver for Dirs {
