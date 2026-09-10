@@ -583,3 +583,22 @@ mod compare_tests {
         assert!(!is_psr_form("TEQNE"));
     }
 }
+
+/// How many words a line occupies once it reaches the encoder.
+///
+/// The location counter settled this during expansion, and every label after
+/// the line was placed on that basis, so whatever the encoder is handed has
+/// to agree -- including when it is handed nothing. An instruction the target
+/// has no equivalent for becomes zero words of *this* many, not one, or the
+/// nine `ADRL`s in BCMSupport's veneers each lose a word and take the rest of
+/// the file four bytes with them.
+pub fn instruction_words(mnemonic: &str) -> usize {
+    let up = mnemonic.to_ascii_uppercase();
+    if is_adrl(&up) {
+        return 2;
+    }
+    match crate::fpa::words(&up) {
+        Some(n) => n as usize,
+        None => 1,
+    }
+}

@@ -200,11 +200,39 @@ def objasm(sh, unit, predefines, extra_i, variables, hdrdirs):
     exported = "".join(f",{root}.{HDR_NAME}.{os.path.basename(d)}." for d in hdrdirs)
     sh.cmd(f"Set Hdr$Path {root}.{STAGE_NAME}.hdr.{exported}")
     via = via_file(predefines)
+    # Redirected into a file rather than read off the screen. ObjAsm prints
+    # the offending listing line before each error, so a unit with twenty
+    # errors says four times more than a terminal holds, and the one line
+    # that explains the run is always the first.
+    log = os.path.join(STAGE, "log")
+    if os.path.isfile(log):
+        os.unlink(log)
+    # What the build gives it, from BuildSys/Makefiles/StdTools:
+    #
+    #     ASFLAGS += -ihdr -i<Hdr$Dir>.Global -i<Hdr$Dir>.Interface     #                -i<Hdr$Dir>.Interface2
+    #
+    # `Hdr$Path` is only consulted for a name written `Hdr:Foo`; the sources
+    # more often write `GET ListOpts` bare, and that is resolved against the
+    # include list. Without it every header a unit reads this way is missing,
+    # which arrives as an unknown opcode wherever one of its macros is used.
+    includes = f" -i {STAGE_NAME} -i {STAGE_NAME}.hdr" + "".join(
+        f" -i {HDR_NAME}.{os.path.basename(d)}" for d in hdrdirs
+    )
     cmd = (
         f"Run {OBJASM} -via {via} -o {STAGE_NAME}.o.{name}"
-        f" -i {STAGE_NAME}{extra_i} {STAGE_NAME}.s.{name}"
+        f"{includes}{extra_i} {STAGE_NAME}.s.{name}"
+        f" {{ > {STAGE_NAME}.log }}"
     )
-    out = sh.cmd(cmd, settle=1.0, max_wait=180.0)
+    screen = sh.cmd(cmd, settle=1.0, max_wait=180.0)
+    out = screen
+    deadline = time.time() + 5.0
+    while not os.path.isfile(log) and time.time() < deadline:
+        time.sleep(0.2)
+    if os.path.isfile(log):
+        try:
+            out = open(log, "rb").read().decode("latin-1").replace("\r", "\n")
+        except OSError:
+            pass
     # HostFS buffers: wait for Windows to see the file.
     for suffix in (",ffd", ""):
         path = os.path.join(STAGE, "o", name + suffix)

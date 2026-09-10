@@ -174,7 +174,7 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>) {
                 }
                 Err(why) => {
                     eprintln!("rosasm: {}:{}: {why}", l.origin.file, l.origin.line);
-                    s.push_str("        .inst 0x00000000\n");
+                    s.push_str(&zero_words(op));
                     index.push(i);
                     continue;
                 }
@@ -197,12 +197,21 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>) {
             Legalized::Unsupported(why) => {
                 eprintln!("rosasm: {}:{}: {why}", l.origin.file, l.origin.line);
                 // Keep the space occupied so later addresses do not shift.
-                s.push_str("        .inst 0x00000000\n");
+                s.push_str(&zero_words(op));
             }
         }
         index.push(i);
     }
     (s, index)
+}
+
+/// The space an instruction was given, filled with nothing.
+///
+/// As many words as the location counter reserved: two for `ADRL`, two for
+/// an FPA compare, one for everything else. Emitting a single word instead
+/// moves every label after it.
+fn zero_words(mnemonic: &str) -> String {
+    "        .inst 0x00000000\n".repeat(rosasm::lower::instruction_words(mnemonic))
 }
 
 /// An `LDR Rd,=value` rendered as a load from the literal pool.
