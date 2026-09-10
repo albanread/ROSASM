@@ -26,6 +26,7 @@ import corpus_diff  # noqa: E402
 from corpus_diff import BUILD_VARS, units  # noqa: E402
 
 ROSASM = r"F:\RISCOSDEV\rosasm\target\release\rosasm.exe"
+AOFDUMP = ROSASM.replace("rosasm.exe", "aofdump.exe")
 PD = [f'{k} SETS "{v}"' for k, v in BUILD_VARS]
 
 
@@ -71,6 +72,19 @@ def assemble(unit):
         out, err = p.stdout, p.stderr
         ok = p.returncode == 0
         size = os.path.getsize(os.path.join(tmp, "out.o")) if ok else 0
+        # An object that will not read back is not an object. This catches a
+        # header that disagrees with the bytes it describes, which the
+        # assembler's own exit status cannot.
+        unreadable = None
+        if ok:
+            d = subprocess.run(
+                [AOFDUMP, os.path.join(tmp, "out.o")], capture_output=True, text=True
+            )
+            if d.returncode != 0:
+                tail = d.stderr.strip().splitlines()
+                unreadable = tail[-1] if tail else "unreadable"
+    if unreadable:
+        return {"unit": unit, "ok": False, "why": f"does not read back: {unreadable}"}
     m = re.search(r"(\d+) bytes in (\d+) area", out)
     return {
         "unit": unit,

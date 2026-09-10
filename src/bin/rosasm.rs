@@ -130,6 +130,24 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>) {
         // One label per line lets the encoded bytes be matched back to the
         // line that produced them, whatever the instruction expands to.
         s.push_str(&format!("__ros{i}:\n"));
+        // A literal the expander could not fold into the instruction lives in
+        // a pool, and the pool is in this same area, so the distance to it is
+        // fixed however the area is placed.
+        if let Some(target) = l.literal {
+            match pool_load(op, &operands, l.addr, target) {
+                Ok(text) => {
+                    s.push_str(&format!("        {text}\n"));
+                    index.push(i);
+                    continue;
+                }
+                Err(why) => {
+                    eprintln!("rosasm: {}:{}: {why}", l.origin.file, l.origin.line);
+                    s.push_str("        .inst 0x00000000\n");
+                    index.push(i);
+                    continue;
+                }
+            }
+        }
         // Legalization decides what the instruction can become: itself, an
         // expansion, or nothing the encoder will accept.
         let ctx = legalize::Context {
@@ -153,6 +171,31 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>) {
         index.push(i);
     }
     (s, index)
+}
+
+/// An `LDR Rd,=value` rendered as a load from the literal pool.
+///
+/// The offset is twelve bits with a sign, so a pool more than 4KB away is out
+/// of reach -- which is the whole reason `LTORG` exists, and the error says so.
+fn pool_load(mnemonic: &str, operands: &str, here: u32, target: u32) -> Result<String, String> {
+    let rd = operands
+        .split_once('=')
+        .map(|(head, _)| head.trim().trim_end_matches(',').trim())
+        .unwrap_or("r0");
+    let delta = target as i64 - here as i64;
+    // `pc` reads eight ahead, and the encoder works that out from `.` itself.
+    if !(-4087..=4103).contains(&delta) {
+        return Err(format!(
+            "the literal pool is {delta} bytes away; an LDR reaches 4KB, so this \
+             needs an LTORG nearer the instruction"
+        ));
+    }
+    let m = rosasm::lower::normalise_mnemonic(mnemonic).unwrap_or_else(|| mnemonic.to_string());
+    Ok(if delta < 0 {
+        format!("{m} {rd}, .-{}", -delta)
+    } else {
+        format!("{m} {rd}, .+{delta}")
+    })
 }
 
 /// The address an `ADR`/`ADRL` is aiming at, when we can supply it.
@@ -433,6 +476,24 @@ fn main() {
                 area.data.extend_from_slice(&text[from..to]);
             }
         }
+    }
+    // Anything that moved the location counter without emitting bytes leaves a
+    // hole -- `SPACE` most of all, which is how SDFS reserves its stack. An
+    // initialised area has to carry every byte it declares, so the holes are
+    // filled here and the declared size becomes the data itself.
+    for (a, size) in areas.iter_mut().zip(ex.area_sizes()) {
+        if a.attributes & area_attr::ZERO_INIT != 0 {
+            continue;
+        }
+        if a.data.len() > *size as usize {
+            eprintln!(
+                "rosasm: area {} holds {} bytes but its location counter reached {size}",
+                a.name,
+                a.data.len()
+            );
+        }
+        a.data.resize((*size as usize).max(a.data.len()), 0);
+        a.reserved = 0;
     }
     // The spec requires each area's length to be a multiple of four.
     for a in &mut areas {

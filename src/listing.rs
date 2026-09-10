@@ -191,6 +191,7 @@ mod tests {
             listing_only: false,
             area_index: 0,
             rout: None,
+            literal: None,
         }
     }
 
@@ -312,6 +313,7 @@ mod byte_layout_tests {
             listing_only: false,
             area_index: 0,
             rout: None,
+            literal: None,
         };
         let s = render(&[l]);
         let rows: Vec<Row> = s.lines().map(parse_row).collect();

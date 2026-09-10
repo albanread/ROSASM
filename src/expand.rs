@@ -69,6 +69,10 @@ pub struct ExpandedLine {
     /// Label of the enclosing `ROUT`, which bounds the search for a local
     /// label: `%FT05` finds the `05` in this routine, never the next one's.
     pub rout: Option<String>,
+    /// For an `LDR Rd,=expression` that needed a literal pool: the offset
+    /// within this area of the word it loads. `None` where the value went
+    /// into the instruction itself as a `MOV` or `MVN`.
+    pub literal: Option<u32>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -330,6 +334,23 @@ pub struct Expander<'a> {
     /// FPA register names declared with `FN`. `FACC FN 0` is `f0`, and the
     /// maths sources name their working registers this way throughout.
     fpa_aliases: std::collections::HashMap<String, u32>,
+    /// Values waiting for the next `LTORG`.
+    pending_literals: Vec<Literal>,
+    /// Pools closed so far this pass, and the ones the previous pass closed.
+    ///
+    /// A literal is loaded from a pool that lies *ahead* of the instruction,
+    /// so the instruction cannot know the address in the pass that places it.
+    /// Pass one settles where every pool goes and pass two reads it back --
+    /// the same arrangement local labels use, and for the same reason.
+    pools: Vec<Pool>,
+    pools_prev: Vec<Pool>,
+    /// What was decided at each `LDR =` in source order: `Some(pool, offset
+    /// within it)` where a pool word was needed, `None` where a `MOV` or `MVN`
+    /// could do the job. Carried between passes so both lay out the same
+    /// bytes, even where pass two could have evaluated something pass one
+    /// could not.
+    literal_sites: Vec<Option<(usize, u32)>>,
+    literal_sites_prev: Vec<Option<(usize, u32)>>,
     /// Local label definitions: (ROUT scope, number, address).
     locals: Vec<LocalDef>,
     /// The assembly-time variables as the caller left them: the `-PD`
@@ -367,6 +388,29 @@ fn unquote_arg(s: &str) -> String {
     } else {
         t.to_string()
     }
+}
+
+/// One value waiting to go into the next literal pool.
+#[derive(Debug, Clone, PartialEq)]
+struct Literal {
+    /// The operand text after `=`. It is what the value is computed from, and
+    /// what a relocation needs if it names a symbol.
+    expr: String,
+    /// Byte offset of this word within its pool.
+    offset: u32,
+    /// The area of the instruction that asked for it. A pool in another area
+    /// is not at a fixed distance, so that is an error rather than a fixup.
+    area: usize,
+}
+
+/// A literal pool, once `LTORG` has said where it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Pool {
+    /// Offset of the first word within `area`.
+    base: u32,
+    /// Bytes the pool occupies.
+    size: u32,
+    area: usize,
 }
 
 /// A data item whose value is not known when the source is assembled.
@@ -468,7 +512,7 @@ enum Chain {
 fn is_zero_size(up: &str) -> bool {
     matches!(
         up,
-        "EXPORT" | "IMPORT" | "EXTERN" | "GLOBAL" | "KEEP" | "ENTRY" | "LTORG" | "DATA"
+        "EXPORT" | "IMPORT" | "EXTERN" | "GLOBAL" | "KEEP" | "ENTRY" | "DATA"
             | "ARM" | "CODE32" | "REQUIRE" | "EXPORTAS" | "STRONG" | "RN" | "CN" | "FN"
             | "DN" | "SN" | "NOFP" | "OPT" | "TTL" | "SUBT" | "ALIGN"
     )
@@ -517,6 +561,11 @@ impl<'a> Expander<'a> {
             reg_aliases: std::collections::HashMap::new(),
             vfp_aliases: std::collections::HashMap::new(),
             fpa_aliases: std::collections::HashMap::new(),
+            pending_literals: Vec::new(),
+            pools: Vec::new(),
+            pools_prev: Vec::new(),
+            literal_sites: Vec::new(),
+            literal_sites_prev: Vec::new(),
             locals: Vec::new(),
             locals_prev: Vec::new(),
             initial_vars: std::collections::HashMap::new(),
@@ -727,6 +776,35 @@ impl<'a> Expander<'a> {
         if !self.conds.is_empty() {
             return self.err(0, "unclosed conditional at end of input");
         }
+        // The manual makes a missing END an error; being lenient about it
+        // costs nothing and losing the pool would be silent corruption.
+        if !self.pending_literals.is_empty() {
+            self.emit_pool(0)?;
+        }
+        Ok(())
+    }
+
+    /// Place the pending pool as a line of its own, for an `END` or the end of
+    /// the input, where there is no `LTORG` to hang it on.
+    fn emit_pool(&mut self, line_num: usize) -> R<()> {
+        if let Some(a) = self.area.as_mut() {
+            a.offset = layout::align_to(a.offset, 4, 0);
+        }
+        let addr = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
+        let area_index = self.current_area_index();
+        let rout = self.rout.clone();
+        let origin = self.origin(line_num);
+        let bytes = self.close_pool(line_num)?;
+        self.out.push(ExpandedLine {
+            text: String::new(),
+            origin,
+            addr,
+            bytes,
+            listing_only: false,
+            area_index,
+            rout,
+            literal: None,
+        });
         Ok(())
     }
 
@@ -902,6 +980,10 @@ impl<'a> Expander<'a> {
                     }
                     let text: String = cs[start..i].iter().collect();
                     match self.eval_immediate(text.trim()) {
+                        // `=` introduces a 32-bit pattern to be loaded, so it
+                        // is written unsigned; `#` is often an addressing
+                        // offset, where the sign is what makes it legal.
+                        Some(n) if lead == '=' => out.push_str(&format!("={n:#X}")),
                         Some(n) => out.push_str(&format!("{lead}{}", immediate(n))),
                         None => {
                             out.push(lead);
@@ -1010,6 +1092,12 @@ impl<'a> Expander<'a> {
         self.conds.clear();
         // Keep them: pass two resolves forward references against pass one.
         self.locals_prev = std::mem::take(&mut self.locals);
+        self.pools_prev = std::mem::take(&mut self.pools);
+        // Both passes walk every literal pool and every data directive, so
+        // the fixups they find would otherwise be recorded twice.
+        self.data_fixups.clear();
+        self.literal_sites_prev = std::mem::take(&mut self.literal_sites);
+        self.pending_literals.clear();
         // Every `GBLx` runs again in pass two, so the variables it declared
         // must go -- otherwise a header's `[ :LNOT: :DEF: Included_Hdr_Foo ]`
         // guard finds itself already set and the header, macros and all, is
@@ -1175,6 +1263,7 @@ impl<'a> Expander<'a> {
                 listing_only: true,
                 area_index,
                 rout,
+                literal: None,
             });
         }
 
@@ -1217,6 +1306,12 @@ impl<'a> Expander<'a> {
             // `END` stops this file; if it was reached via GET, assembly
             // resumes after the GET in the including file.
             "END" => {
+                // "A default LTORG is executed at every END directive which is
+                // not part of a nested assembly": a GET'd file ending flushes
+                // nothing, the top-level one does.
+                if self.stack.len() == 1 && !self.pending_literals.is_empty() {
+                    self.emit_pool(line.num)?;
+                }
                 self.pop_source();
             }
             // Absolute symbol definition. These must happen during expansion,
@@ -1339,6 +1434,7 @@ impl<'a> Expander<'a> {
             listing_only: true,
             area_index,
             rout: self.rout.clone(),
+            literal: None,
         });
     }
 
@@ -1643,6 +1739,14 @@ impl<'a> Expander<'a> {
 
     /// `AREA name«,attr»...` starts a section; the location counter restarts.
     fn do_area(&mut self, line: &Line) -> R<()> {
+        // A pool is reached by a fixed offset from the instruction that loads
+        // from it, so it has to live in the same area. Leaving one behind
+        // flushes it here, which is what lets SDFS's `freeveneer` write
+        // `LDR a2,=free_stack_relocations` in its code area and then start a
+        // data area without an LTORG of its own.
+        if !self.pending_literals.is_empty() {
+            self.emit_pool(line.num)?;
+        }
         let operands = self.expand_text(line.operands_str().unwrap_or(""));
         match layout::parse_area(&operands) {
             Ok((name, attrs)) => {
@@ -1755,9 +1859,14 @@ impl<'a> Expander<'a> {
                 }
             }
             // Directives that emit nothing.
-            "EXPORT" | "IMPORT" | "EXTERN" | "GLOBAL" | "KEEP" | "ENTRY" | "LTORG" | "DATA"
+            "EXPORT" | "IMPORT" | "EXTERN" | "GLOBAL" | "KEEP" | "ENTRY" | "DATA"
             | "ARM" | "CODE32" | "REQUIRE" | "EXPORTAS" | "STRONG" | "RN" | "CN" | "FN"
             | "DN" | "SN" | "NOFP" | "OPT" | "TTL" | "SUBT" => {}
+            // `LTORG` puts the pool here, word aligned. Its size is whatever
+            // the literals asked for since the last one.
+            "LTORG" => {
+                area.offset = layout::align_to(area.offset, 4, 0);
+            }
             // `ADRL` is a pseudo-instruction that always occupies two
             // instructions, whether or not the offset would fit in one.
             _ if crate::lower::is_adrl(&up) => area.offset = area.offset.wrapping_add(8),
@@ -1852,6 +1961,159 @@ impl<'a> Expander<'a> {
             }
         }
         (out, holes)
+    }
+
+
+    // -------------------------------------------------------- literal pools
+
+    /// Is this an `LDR Rd,=expression`, and if so what follows the `=`?
+    ///
+    /// The manual gives the whole family: `LDR`, and the byte, halfword,
+    /// signed and doubleword forms, in either suffix order.
+    fn literal_operand(line: &Line) -> Option<String> {
+        let op = line.opcode_str()?.to_ascii_uppercase();
+        if !op.starts_with("LDR") {
+            return None;
+        }
+        let operands = line.operands_str()?;
+        let (_, rest) = operands.split_once('=')?;
+        // `=` only introduces a literal in the last operand position; an
+        // addressing mode never contains one.
+        if operands.split_once('=')?.0.contains('[') {
+            return None;
+        }
+        Some(rest.trim().to_string())
+    }
+
+    /// Decide what an `LDR Rd,=expression` does, and reserve a pool word if it
+    /// needs one.
+    ///
+    /// The manual's order is: use a `MOV` if the value fits one, else an `MVN`
+    /// if the complement does, else load it program-relative from the next
+    /// pool, sharing a word with an identical literal already waiting there.
+    ///
+    /// A value that names a label or an imported symbol always takes a pool
+    /// word even when it would fit an immediate, because the linker has to be
+    /// able to relocate it and there is nowhere in a `MOV` to put a
+    /// relocation.
+    fn note_literal(&mut self, line: &Line) -> Option<u32> {
+        let expr = self.expand_text(&Self::literal_operand(line)?);
+        let site = self.literal_sites.len();
+        let area = self.current_area_index();
+
+        // Pass two repeats pass one's decision, so both lay out the same
+        // bytes even where pass two could evaluate something pass one could
+        // not -- a forward `EQU`, most often.
+        if let Some(prev) = self.literal_sites_prev.get(site).copied() {
+            self.literal_sites.push(prev);
+            let (pool, offset) = prev?;
+            // Re-reserve it so the pool still knows its own size.
+            self.reserve_literal(&expr, area, Some(offset));
+            let p = self.pools_prev.get(pool).copied()?;
+            return Some(p.base + offset);
+        }
+
+        let value = match expr::eval(&expr, &self.syms) {
+            Ok(Value::Arith(n)) => Some(n),
+            _ => None,
+        };
+        let relocatable = identifiers(&expr)
+            .iter()
+            .any(|n| self.label_defs.contains_key(n) || self.imports.contains(n));
+        let fits = value.is_some_and(|v| {
+            crate::legalize::as_arm_immediate(v).is_some()
+                || crate::legalize::as_arm_immediate(!v).is_some()
+        });
+        if fits && !relocatable {
+            self.literal_sites.push(None);
+            return None;
+        }
+        let offset = self.reserve_literal(&expr, area, None);
+        self.literal_sites.push(Some((self.pools.len(), offset)));
+        // The pool has not been placed yet in this pass, so there is no
+        // address to give back.
+        None
+    }
+
+    /// Find or make room for a literal in the pool being filled, returning its
+    /// offset within that pool.
+    fn reserve_literal(&mut self, expr: &str, area: usize, at: Option<u32>) -> u32 {
+        let expr = expr.trim();
+        if let Some(l) = self.pending_literals.iter().find(|l| l.expr == expr) {
+            return l.offset;
+        }
+        let offset = at.unwrap_or_else(|| 4 * self.pending_literals.len() as u32);
+        self.pending_literals.push(Literal {
+            expr: expr.to_string(),
+            offset,
+            area,
+        });
+        offset
+    }
+
+    /// Close the pool being filled and hand back its words.
+    ///
+    /// Called at `LTORG`, and at the outermost `END` -- the manual has a
+    /// default `LTORG` there, "not part of a nested assembly", so a `GET`
+    /// ending does not flush anything.
+    fn close_pool(&mut self, line_num: usize) -> R<Vec<u8>> {
+        let base = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
+        let area = self.current_area_index();
+        let literals = std::mem::take(&mut self.pending_literals);
+        let size = 4 * literals.len() as u32;
+        self.pools.push(Pool { base, size, area });
+
+        let mut bytes = Vec::with_capacity(size as usize);
+        for l in &literals {
+            if l.area != area {
+                return self.err(
+                    line_num,
+                    format!(
+                        "the literal `{}` is used in area {} but its pool lands in area {}",
+                        l.expr, l.area, area
+                    ),
+                );
+            }
+            let v = match expr::eval(&l.expr, &self.syms) {
+                Ok(Value::Arith(n)) => n,
+                // Not an error: an imported symbol has no value here, and the
+                // relocation below is what supplies it.
+                _ => 0,
+            };
+            bytes.extend_from_slice(&v.to_le_bytes());
+            // A pool word holding an address moves when the linker places the
+            // area, exactly as `DCD Label` does.
+            if let Some(kind) = self.fixup_kind(&l.expr) {
+                self.data_fixups.push(DataFixup {
+                    area,
+                    offset: base + l.offset,
+                    width: 4,
+                    expr: l.expr.clone(),
+                    kind,
+                });
+            }
+        }
+        if let Some(a) = self.area.as_mut() {
+            a.offset = a.offset.wrapping_add(size);
+        }
+        self.set_builtin_dot();
+        Ok(bytes)
+    }
+
+    /// How a value naming a symbol has to be relocated, if at all.
+    fn fixup_kind(&self, expr: &str) -> Option<FixupKind> {
+        let names = identifiers(expr);
+        let areas: Vec<usize> = names
+            .iter()
+            .filter_map(|n| self.label_defs.get(n).map(|(a, _)| *a))
+            .collect();
+        if let Some(a) = areas.first() {
+            return areas.iter().all(|x| x == a).then_some(FixupKind::AreaBase(*a));
+        }
+        names
+            .iter()
+            .find(|n| self.imports.contains(n))
+            .map(|n| FixupKind::External(n.clone()))
     }
 
     /// Record a label's address. Local labels (a bare number) are kept
@@ -2065,13 +2327,22 @@ impl<'a> Expander<'a> {
             }
         }
         if relexed.kind == Kind::Statement {
-            let addr = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
+            let mut addr = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
+            // Before advancing, so the pool sees its literals in source order.
+            let literal = self.note_literal(&relexed);
             self.advance(&relexed);
             let mut bytes = self.data_bytes(&relexed);
+            let up = relexed.opcode_str().unwrap_or("").to_ascii_uppercase();
             // ALIGN pads to the boundary, and ObjAsm lists the pad bytes.
-            if relexed.opcode_str().map(|o| o.eq_ignore_ascii_case("ALIGN")) == Some(true) {
+            if up == "ALIGN" {
                 let after = self.area.as_ref().map(|a| a.offset).unwrap_or(addr);
                 bytes = vec![0u8; after.saturating_sub(addr) as usize];
+            }
+            // `LTORG` is where the pool goes; `advance` has just aligned to a
+            // word, so this is its base.
+            if up == "LTORG" {
+                addr = self.area.as_ref().map(|a| a.offset).unwrap_or(addr);
+                bytes = self.close_pool(line.num)?;
             }
             let origin = self.origin(line.num);
             let area_index = self.current_area_index();
@@ -2084,6 +2355,7 @@ impl<'a> Expander<'a> {
                 listing_only: false,
                 area_index,
                 rout,
+                literal,
             });
         }
         Ok(())
@@ -2759,5 +3031,145 @@ Next    MOV r1, #2
     fn a_bad_area_attribute_is_reported() {
         assert!(fails("        AREA Test, WIBBLE
 ").contains("WIBBLE"));
+    }
+}
+
+#[cfg(test)]
+mod literal_pool_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The expanded lines, so a test can look at addresses and bytes.
+    fn lines(src: &str) -> Vec<ExpandedLine> {
+        let src: Vec<String> = src.lines().map(|s| s.to_string()).collect();
+        let r = MapResolver(HashMap::new());
+        let mut e = Expander::new(&r);
+        match e.run("test", src) {
+            Ok(o) => o,
+            Err(err) => panic!("{err}"),
+        }
+    }
+
+    /// The pool words, as the bytes of whichever line carries them.
+    fn pool(src: &str) -> Vec<u32> {
+        lines(src)
+            .iter()
+            .filter(|l| !l.listing_only && !l.bytes.is_empty())
+            .flat_map(|l| l.bytes.chunks_exact(4))
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect()
+    }
+
+    /// Where each `LDR =` was told to load from, in order.
+    fn targets(src: &str) -> Vec<Option<u32>> {
+        lines(src)
+            .iter()
+            .filter(|l| !l.listing_only && l.text.to_ascii_uppercase().contains("LDR"))
+            .map(|l| l.literal)
+            .collect()
+    }
+
+    const HEAD: &str = "        AREA c, CODE, READONLY\n";
+
+    #[test]
+    fn a_value_that_fits_an_immediate_takes_no_pool_word() {
+        // MOV covers it, so nothing is reserved and the pool stays empty.
+        let src = format!("{HEAD}        LDR r0, =0\n        LTORG\n        END\n");
+        assert_eq!(targets(&src), vec![None]);
+        assert!(pool(&src).is_empty());
+    }
+
+    #[test]
+    fn a_complemented_immediate_takes_no_pool_word_either() {
+        // MVN covers &FFFFFFFF.
+        let src = format!("{HEAD}        LDR r0, =&FFFFFFFF\n        LTORG\n        END\n");
+        assert_eq!(targets(&src), vec![None]);
+        assert!(pool(&src).is_empty());
+    }
+
+    #[test]
+    fn a_value_that_fits_neither_goes_in_the_pool() {
+        let src = format!("{HEAD}        LDR r0, =&12345678\n        LTORG\n        END\n");
+        assert_eq!(pool(&src), vec![0x1234_5678]);
+        // The instruction is at 0 and the pool follows it.
+        assert_eq!(targets(&src), vec![Some(4)]);
+    }
+
+    #[test]
+    fn two_uses_of_one_value_share_a_word() {
+        let src = format!(
+            "{HEAD}        LDR r0, =&12345678\n        LDR r1, =&12345678\n        LTORG\n        END\n"
+        );
+        assert_eq!(pool(&src), vec![0x1234_5678], "one word, not two");
+        assert_eq!(targets(&src), vec![Some(8), Some(8)], "both load the same word");
+    }
+
+    #[test]
+    fn different_values_get_a_word_each() {
+        let src = format!(
+            "{HEAD}        LDR r0, =&12345678\n        LDR r1, =&AABBCCDD\n        LTORG\n        END\n"
+        );
+        assert_eq!(pool(&src), vec![0x1234_5678, 0xAABB_CCDD]);
+        assert_eq!(targets(&src), vec![Some(8), Some(12)]);
+    }
+
+    #[test]
+    fn ltorg_places_the_pool_where_it_stands() {
+        // Two instructions, then the pool: the word is at 8.
+        let src = format!(
+            "{HEAD}        LDR r0, =&12345678\n        MOV r1, #1\n        LTORG\n        END\n"
+        );
+        assert_eq!(targets(&src), vec![Some(8)]);
+    }
+
+    #[test]
+    fn a_second_ltorg_starts_a_second_pool() {
+        let src = format!(
+            "{HEAD}        LDR r0, =&11111111\n        LTORG\n\
+             \x20       LDR r1, =&22222222\n        LTORG\n        END\n"
+        );
+        assert_eq!(pool(&src), vec![0x1111_1111, 0x2222_2222]);
+        // The first is loaded from 4, the second from 12: each from its own
+        // pool, not both from the first.
+        assert_eq!(targets(&src), vec![Some(4), Some(12)]);
+    }
+
+    #[test]
+    fn end_flushes_the_pool_when_no_ltorg_did() {
+        // "A default LTORG is executed at every END directive".
+        let src = format!("{HEAD}        LDR r0, =&12345678\n        MOV pc, lr\n        END\n");
+        assert_eq!(pool(&src), vec![0x1234_5678]);
+        assert_eq!(targets(&src), vec![Some(8)]);
+    }
+
+    #[test]
+    fn a_label_always_takes_a_pool_word() {
+        // Even though 4 would fit a MOV: the linker has to be able to relocate
+        // it, and there is nowhere in a MOV to put a relocation.
+        let src = format!(
+            "{HEAD}        LDR r0, =Here\n        MOV pc, lr\nHere    DCD 0\n        END\n"
+        );
+        // The default LTORG at END puts the pool after Here, at 12, and
+        // the word holds Here's own offset for the linker to relocate.
+        assert_eq!(targets(&src), vec![Some(12)]);
+        assert_eq!(pool(&src), vec![0, 8], "Here's DCD, then the pool word");
+    }
+
+    #[test]
+    fn the_pool_is_word_aligned() {
+        // A byte directive leaves the counter odd; the pool must not start there.
+        let src = format!(
+            "{HEAD}        LDR r0, =&12345678\n        DCB 1\n        LTORG\n        END\n"
+        );
+        // Instruction at 0, DCB at 4, so the pool aligns from 5 up to 8.
+        assert_eq!(targets(&src), vec![Some(8)]);
+    }
+
+    #[test]
+    fn an_ldr_with_an_addressing_mode_is_not_a_literal() {
+        // `LDR r0,[r1,#=4]` is not a thing, but an `=` must not be found
+        // inside brackets either way.
+        let src = format!("{HEAD}        LDR r0, [r1, #4]\n        LTORG\n        END\n");
+        assert!(pool(&src).is_empty());
     }
 }
