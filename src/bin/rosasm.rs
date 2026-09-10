@@ -17,7 +17,7 @@ use std::process::Command;
 use rosasm::aof::{self, area_attr, sym_attr};
 use rosasm::elfread;
 use rosasm::expand::{self, Expander, ExpandedLine, FileResolver};
-use rosasm::legalize::{self, Legalized};
+use rosasm::legalize::{self, AdrTarget, Legalized};
 use rosasm::lex;
 use rosasm::reloc;
 use rosasm::source::SourceFile;
@@ -198,34 +198,74 @@ fn pool_load(mnemonic: &str, operands: &str, here: u32, target: u32) -> Result<S
     })
 }
 
-/// The address an `ADR`/`ADRL` is aiming at, when we can supply it.
+/// What an `ADR`/`ADRL` is aiming at, when we can supply it.
 ///
-/// These are pseudo-instructions the encoder cannot expand, because the label
-/// is ours and its value is an offset within an AOF area. A target in another
-/// area has no fixed distance from here, so it is refused rather than expanded
-/// into something that would only be right by accident.
-fn adr_target(op: &str, operands: &str, l: &ExpandedLine, ex: &Expander) -> Option<u32> {
+/// The manual gives three kinds of expression -- register-relative,
+/// program-relative and numeric -- and each becomes a different instruction,
+/// so working out which it is happens here rather than in the encoding.
+///
+/// By the time the operands reach here, `encoder_operands` has already turned
+/// a label or a local label in this same area into an offset from `.`, which
+/// for this instruction is its own address. That is what marks the expression
+/// as program-relative, and it also has to be read that way rather than
+/// evaluated, because `.` in the symbol table holds wherever the location
+/// counter finished, not where this line is.
+///
+/// A target in another area has no fixed distance from here, so it is refused
+/// rather than expanded into something that would only be right by accident.
+fn adr_target(op: &str, operands: &str, l: &ExpandedLine, ex: &Expander) -> Option<AdrTarget> {
     if !rosasm::lower::is_adr(op) && !rosasm::lower::is_adrl(op) {
         return None;
     }
-    let target = operands.split(',').nth(1)?.trim();
-    for name in expand::identifiers(target) {
-        match ex.label_defs().get(&name) {
-            Some((area, _)) if *area == l.area_index => {}
-            Some(_) => {
+    let target = operands.split_once(',')?.1.trim();
+
+    // Program-relative: `.`, or an expression built on it such as the
+    // `dtanid + (16 * 3)` the sources write.
+    if target.starts_with('.') {
+        let rest = &target[1..];
+        if rest.is_empty() || rest.starts_with(['+', '-']) {
+            let text = format!("{}{rest}", l.addr);
+            return match rosasm::expr::eval(&text, ex.symbols()) {
+                Ok(rosasm::symtab::Value::Arith(n)) => Some(AdrTarget::Program(n)),
+                _ => None,
+            };
+        }
+        return None;
+    }
+
+    let names = expand::identifiers(target);
+    for name in &names {
+        if let Some((area, _)) = ex.label_defs().get(name) {
+            if *area != l.area_index {
                 eprintln!(
                     "rosasm: {}:{}: {op} reaches into another area, which has no fixed distance",
                     l.origin.file, l.origin.line
                 );
                 return None;
             }
-            None => {}
         }
     }
-    match rosasm::expr::eval(target, ex.symbols()) {
-        Ok(rosasm::symtab::Value::Arith(n)) => Some(n),
-        _ => None,
+    let value = match rosasm::expr::eval(target, ex.symbols()) {
+        Ok(rosasm::symtab::Value::Arith(n)) => n,
+        _ => return None,
+    };
+    // Register-relative: a `MAP expr,Rn` made this symbol an offset from Rn.
+    // Two symbols with different bases in one expression is meaningless, so
+    // that is left unresolved rather than guessed at.
+    let bases: Vec<u32> = names
+        .iter()
+        .filter_map(|n| ex.field_bases().get(n).copied())
+        .collect();
+    if let Some(base) = bases.first() {
+        if bases.iter().all(|b| b == base) {
+            // A storage map may be based below its register, so the offset
+            // reads as signed.
+            return Some(AdrTarget::Register { base: *base, offset: value as i32 });
+        }
+        return None;
     }
+    // Numeric: not relative to anything, so it is moved rather than added.
+    Some(AdrTarget::Numeric(value))
 }
 
 /// Where one run of the encoder's output ended up in an area.

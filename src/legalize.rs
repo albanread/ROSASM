@@ -42,8 +42,25 @@ pub enum Legalized {
 pub struct Context {
     /// Address of the instruction being legalized, within its area.
     pub here: u32,
-    /// Value of the operand's target, when it is known.
-    pub target: Option<u32>,
+    /// What an `ADR`/`ADRL` is aiming at, when it is known.
+    pub target: Option<AdrTarget>,
+}
+
+/// The three kinds of expression `ADR` accepts, from the manual: "The
+/// expression may be register-relative, program-relative or numeric", and each
+/// produces a different instruction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AdrTarget {
+    /// An address in this same area. `ADD`/`SUB` against `pc`.
+    Program(u32),
+    /// A plain number, with no program or register to be relative to.
+    /// `MOV`/`MVN`, or `MOVW`+`MOVT` where the long form needs the range.
+    Numeric(u32),
+    /// An offset from the base register a `MAP expr,Rn` established.
+    /// `ADD`/`SUB` against that register. The offset is signed, because a
+    /// storage map may start below its base: `^ -12,R12` is how DragAnObj
+    /// describes the words it keeps under the stack pointer.
+    Register { base: u32, offset: i32 },
 }
 
 // ------------------------------------------------------- ARM immediates
@@ -97,30 +114,46 @@ pub fn split_immediates(mut v: u32, max_parts: usize) -> Option<Vec<u32>> {
 /// `pc` reads as the instruction's own address plus eight, so the offset is
 /// measured from there. A negative offset becomes `SUB`.
 pub fn expand_adrl(cond: &str, rd: &str, here: u32, target: u32) -> Legalized {
-    let delta = (target as i64) - (here as i64 + 8);
+    add_or_sub(cond, rd, "pc", target as i64 - (here as i64 + 8), 2)
+}
+
+/// `Rd := base ± magnitude`, in exactly `count` instructions.
+///
+/// The immediate is eight bits rotated by an even amount, so a wide offset has
+/// to be built up in pieces: the first works from `base` and each one after it
+/// from the destination. Exactly `count` instructions come out even when fewer
+/// would do, because the location counter was advanced on that basis and a
+/// short expansion would move every label after it.
+fn add_or_sub(cond: &str, rd: &str, base: &str, delta: i64, count: usize) -> Legalized {
     let (op, mag) = if delta >= 0 {
         ("ADD", delta as u32)
     } else {
         ("SUB", (-delta) as u32)
     };
-    let Some(parts) = split_immediates(mag, 2) else {
-        return Legalized::Unsupported(format!(
-            "ADRL offset {delta} needs more than two instructions"
-        ));
+    let Some(parts) = split_immediates(mag, count) else {
+        return Legalized::Unsupported(if count == 1 {
+            format!("offset {delta} does not fit one instruction; ADRL reaches further")
+        } else {
+            format!("offset {delta} needs more than {count} instructions")
+        });
     };
-    let mut out = Vec::new();
-    // The first instruction works from pc, the rest from the destination.
-    for (i, p) in parts.iter().enumerate() {
-        let src = if i == 0 { "pc" } else { rd };
-        out.push((format!("{op}{cond}"), format!("{rd}, {src}, #{p}")));
-    }
-    // A single part still needs two instructions to keep the size fixed:
-    // ObjAsm's ADRL always occupies eight bytes, and the location counter
-    // has already been advanced on that basis.
-    if out.len() == 1 {
+    let mut out: Vec<(String, String)> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let src = if i == 0 { base } else { rd };
+            (format!("{op}{cond}"), format!("{rd}, {src}, #{p}"))
+        })
+        .collect();
+    while out.len() < count {
         out.push((format!("{op}{cond}"), format!("{rd}, {rd}, #0")));
     }
-    Legalized::Many(out)
+    if out.len() == 1 {
+        let (m, o) = out.pop().unwrap();
+        Legalized::One(m, o)
+    } else {
+        Legalized::Many(out)
+    }
 }
 
 /// Expand `ADR Rd, target` into the single instruction it stands for.
@@ -128,18 +161,7 @@ pub fn expand_adrl(cond: &str, rd: &str, here: u32, target: u32) -> Legalized {
 /// Unlike `ADRL` this is one instruction, so the offset has to fit in a single
 /// rotated immediate; if it does not, the source wanted `ADRL`.
 pub fn expand_adr(cond: &str, rd: &str, here: u32, target: u32) -> Legalized {
-    let delta = (target as i64) - (here as i64 + 8);
-    let (op, mag) = if delta >= 0 {
-        ("ADD", delta as u32)
-    } else {
-        ("SUB", (-delta) as u32)
-    };
-    if as_arm_immediate(mag).is_none() {
-        return Legalized::Unsupported(format!(
-            "ADR offset {delta} does not fit one instruction; ADRL reaches further"
-        ));
-    }
-    Legalized::One(format!("{op}{cond}"), format!("{rd}, pc, #{mag}"))
+    add_or_sub(cond, rd, "pc", target as i64 - (here as i64 + 8), 1)
 }
 
 /// A literal already reduced to a number by the expression evaluator.
@@ -152,34 +174,48 @@ fn parse_number(s: &str) -> Result<u32, ()> {
     v.map_err(|_| ())
 }
 
-/// The condition suffix on a mnemonic whose stem is known.
-fn condition_of(mnemonic: &str, stem: &str) -> String {
-    mnemonic
-        .to_ascii_uppercase()
-        .strip_prefix(stem)
-        .unwrap_or("")
-        .to_string()
-}
-
 /// Legalize one instruction.
 pub fn legalize(mnemonic: &str, operands: &str, ctx: &Context) -> Legalized {
     let up = mnemonic.to_ascii_uppercase();
 
-    if lower::is_adr(&up) {
-        let cond = condition_of(&up, "ADR");
+    if lower::is_adr(&up) || lower::is_adrl(&up) {
+        // The long form is always two instructions, the short one always one.
+        let count = if lower::is_adrl(&up) { 2 } else { 1 };
+        let cond = lower::adr_condition(&up);
         let rd = operands.split(',').next().unwrap_or("r0").trim().to_string();
-        return match ctx.target {
-            Some(t) => expand_adr(&cond, &rd, ctx.here, t),
-            None => Legalized::Unsupported("ADR to an unresolved target".into()),
+        let Some(target) = ctx.target else {
+            return Legalized::Unsupported(format!("{up} to an unresolved target"));
         };
-    }
-
-    if lower::is_adrl(&up) {
-        let cond = condition_of(&up, "ADRL");
-        let rd = operands.split(',').next().unwrap_or("r0").trim().to_string();
-        return match ctx.target {
-            Some(t) => expand_adrl(&cond, &rd, ctx.here, t),
-            None => Legalized::Unsupported("ADRL to an unresolved target".into()),
+        return match target {
+            AdrTarget::Program(t) => {
+                match add_or_sub(&cond, &rd, "pc", t as i64 - (ctx.here as i64 + 8), count) {
+                    Legalized::Unsupported(why) => Legalized::Unsupported(format!("{up} {why}")),
+                    other => other,
+                }
+            }
+            AdrTarget::Register { base, offset } => {
+                match add_or_sub(&cond, &rd, &format!("r{base}"), offset as i64, count) {
+                    Legalized::Unsupported(why) => Legalized::Unsupported(format!("{up} {why}")),
+                    other => other,
+                }
+            }
+            // A number is not relative to anything, so it is moved rather
+            // than added. The long form always takes two instructions, and
+            // `MOVW`/`MOVT` between them cover every 32-bit value.
+            AdrTarget::Numeric(v) if count == 2 => Legalized::Many(vec![
+                (format!("MOVW{cond}"), format!("{rd}, #{}", v & 0xFFFF)),
+                (format!("MOVT{cond}"), format!("{rd}, #{}", v >> 16)),
+            ]),
+            AdrTarget::Numeric(v) if as_arm_immediate(v).is_some() => {
+                Legalized::One(format!("MOV{cond}"), format!("{rd}, #{v}"))
+            }
+            AdrTarget::Numeric(v) if as_arm_immediate(!v).is_some() => {
+                Legalized::One(format!("MVN{cond}"), format!("{rd}, #{}", !v))
+            }
+            AdrTarget::Numeric(v) => Legalized::Unsupported(format!(
+                "{up} needs &{v:X} in one instruction, which no MOV or MVN can do; \
+                 ADRL reaches further"
+            )),
         };
     }
 
@@ -189,7 +225,7 @@ pub fn legalize(mnemonic: &str, operands: &str, ctx: &Context) -> Legalized {
     // literal pool, which is LTORG's business and not yet built.
     if up.starts_with("LDR") {
         if let Some(rest) = operands.split_once('=') {
-            let cond = condition_of(&up, "LDR");
+            let cond = up.strip_prefix("LDR").unwrap_or("").to_string();
             let rd = rest.0.trim_end_matches([',', ' ']).trim().to_string();
             if let Ok(v) = parse_number(rest.1.trim()) {
                 if as_arm_immediate(v).is_some() {
@@ -398,6 +434,77 @@ mod tests {
             Legalized::Unsupported(why) => assert!(why.contains("literal pool"), "{why}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_numeric_adr_moves_rather_than_adds() {
+        // "Numeric: MOV|MVN register,#constant will be produced."
+        let ctx = |v| Context { here: 0, target: Some(AdrTarget::Numeric(v)) };
+        assert_eq!(
+            legalize("ADR", "r5, 44", &ctx(44)),
+            Legalized::One("MOV".into(), "r5, #44".into())
+        );
+        // -1 is not an immediate, but its complement is.
+        assert_eq!(
+            legalize("ADR", "r0, x", &ctx(0xFFFF_FFFF)),
+            Legalized::One("MVN".into(), "r0, #0".into())
+        );
+        // Neither: the manual says an error, and the message points at ADRL.
+        match legalize("ADR", "r0, x", &ctx(0x1234_5678)) {
+            Legalized::Unsupported(why) => assert!(why.contains("ADRL"), "{why}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_numeric_adrl_builds_the_word_in_two_halves() {
+        // MOV32, which is MOVW then MOVT, and always two instructions.
+        let ctx = Context { here: 0, target: Some(AdrTarget::Numeric(0x1234_5678)) };
+        let Legalized::Many(v) = legalize("ADRL", "r6, x", &ctx) else {
+            panic!("expected two instructions")
+        };
+        assert_eq!(v[0], ("MOVW".into(), "r6, #22136".into()));
+        assert_eq!(v[1], ("MOVT".into(), "r6, #4660".into()));
+    }
+
+    #[test]
+    fn a_register_relative_adr_adds_to_its_base() {
+        // `MAP 0,r9` then `Slot # 4` makes Slot four past r9.
+        let ctx = Context {
+            here: 0,
+            target: Some(AdrTarget::Register { base: 9, offset: 4 }),
+        };
+        assert_eq!(
+            legalize("ADR", "r4, Slot", &ctx),
+            Legalized::One("ADD".into(), "r4, r9, #4".into())
+        );
+    }
+
+    #[test]
+    fn a_storage_map_may_sit_below_its_base() {
+        // `^ -12,R12` is how DragAnObj describes words under the stack
+        // pointer, so the offset is negative and the instruction subtracts.
+        let ctx = Context {
+            here: 0,
+            target: Some(AdrTarget::Register { base: 12, offset: -8 }),
+        };
+        assert_eq!(
+            legalize("ADR", "r1, area1", &ctx),
+            Legalized::One("SUB".into(), "r1, r12, #8".into())
+        );
+    }
+
+    #[test]
+    fn the_pre_ual_adrl_spelling_gets_two_instructions_and_its_condition() {
+        // `ADREQL` is ADRL conditional on EQ, and must not be read as ADR --
+        // that would be one instruction where the layout counted two.
+        let ctx = Context { here: 8, target: Some(AdrTarget::Program(44)) };
+        let Legalized::Many(v) = legalize("ADREQL", "r2, Msg", &ctx) else {
+            panic!("expected two instructions")
+        };
+        assert_eq!(v.len(), 2);
+        assert!(v.iter().all(|(m, _)| m == "ADDEQ"), "{v:?}");
+        assert_eq!(v[0].1, "r2, pc, #28", "pc reads eight past the first");
     }
 
     #[test]

@@ -334,6 +334,11 @@ pub struct Expander<'a> {
     /// FPA register names declared with `FN`. `FACC FN 0` is `f0`, and the
     /// maths sources name their working registers this way throughout.
     fpa_aliases: std::collections::HashMap<String, u32>,
+    /// The base register the current `MAP` established, if it named one.
+    map_base: Option<u32>,
+    /// Symbols a `FIELD` defined under such a `MAP`, and the register they are
+    /// relative to. `ADR Rd,Sym` on one of these is `ADD Rd,Rn,#offset`.
+    field_bases: std::collections::HashMap<String, u32>,
     /// Values waiting for the next `LTORG`.
     pending_literals: Vec<Literal>,
     /// Pools closed so far this pass, and the ones the previous pass closed.
@@ -561,6 +566,8 @@ impl<'a> Expander<'a> {
             reg_aliases: std::collections::HashMap::new(),
             vfp_aliases: std::collections::HashMap::new(),
             fpa_aliases: std::collections::HashMap::new(),
+            map_base: None,
+            field_bases: std::collections::HashMap::new(),
             pending_literals: Vec::new(),
             pools: Vec::new(),
             pools_prev: Vec::new(),
@@ -838,6 +845,11 @@ impl<'a> Expander<'a> {
         &self.data_fixups
     }
 
+    /// Symbols that are relative to a base register, and which register.
+    pub fn field_bases(&self) -> &std::collections::HashMap<String, u32> {
+        &self.field_bases
+    }
+
     /// Register names declared with `RN`.
     pub fn reg_aliases(&self) -> &std::collections::HashMap<String, u32> {
         &self.reg_aliases
@@ -904,6 +916,42 @@ impl<'a> Expander<'a> {
         }
     }
 
+    /// What one name in an operand becomes, or `None` to leave it alone.
+    ///
+    /// A label in this same area is at a fixed distance, so it becomes an
+    /// offset from `.` rather than a symbol the encoder would have to relocate
+    /// -- which for a `VLDR` it cannot do at all, and which for an `ADR` we
+    /// would rather do ourselves. A label elsewhere keeps its name and becomes
+    /// a relocation directive.
+    fn resolve_name(&self, word: &str, line: &ExpandedLine) -> Option<String> {
+        if let Some((a, t)) = self.label_defs.get(word) {
+            if *a == line.area_index {
+                let d = *t as i64 - line.addr as i64;
+                return Some(if d < 0 {
+                    format!(".-{}", -d)
+                } else {
+                    format!(".+{d}")
+                });
+            }
+            return None;
+        }
+        if let Some(n) = self.reg_aliases.get(word) {
+            // `r15` as a source operand is rejected on ARMv8; `pc` is the same
+            // register under the name the encoder will take.
+            return Some(if *n == 15 { "pc".into() } else { format!("r{n}") });
+        }
+        if let Some((kind, n)) = self.vfp_aliases.get(word) {
+            return Some(format!("{kind}{n}"));
+        }
+        if let Some(n) = self.fpa_aliases.get(word) {
+            // Reduced to the architectural spelling; which VFP register it
+            // becomes depends on the instruction's precision, which only the
+            // FPA translation knows.
+            return Some(format!("f{n}"));
+        }
+        None
+    }
+
     /// Rewrite an instruction's operands into something the encoder can parse.
     ///
     /// This is where the division of labour is enforced: ObjAsm's expression
@@ -956,9 +1004,19 @@ impl<'a> Expander<'a> {
                         i += 1;
                     }
                     i += 1; // the closing bar
-                    out.push('"');
-                    out.push_str(&name);
-                    out.push('"');
+                    // The bars are delimiters, so what they hold is a name
+                    // like any other -- `|_kernel_malloc|` is a label the file
+                    // defines, and reaches the same treatment. Only a name
+                    // this file does not define stays quoted, which is what
+                    // lets the encoder accept the characters in it.
+                    match self.resolve_name(&name, line) {
+                        Some(text) => out.push_str(&text),
+                        None => {
+                            out.push('"');
+                            out.push_str(&name);
+                            out.push('"');
+                        }
+                    }
                 }
                 '#' | '=' => {
                     let lead = cs[i];
@@ -1026,40 +1084,9 @@ impl<'a> Expander<'a> {
                         i += 1;
                     }
                     let word: String = cs[start..i].iter().collect();
-                    // A label in this same area is at a fixed distance, so it
-                    // becomes an offset from `.` rather than a symbol the
-                    // encoder would have to relocate -- which for a `VLDR` it
-                    // cannot do at all. A label elsewhere keeps its name and
-                    // becomes a relocation directive.
-                    if let Some((a, t)) = self.label_defs.get(&word) {
-                        if *a == line.area_index {
-                            let d = *t as i64 - line.addr as i64;
-                            out.push_str(&if d < 0 {
-                                format!(".-{}", -d)
-                            } else {
-                                format!(".+{d}")
-                            });
-                            continue;
-                        }
-                    }
-                    if let Some(n) = self.reg_aliases.get(&word) {
-                        // `r15` as a source operand is rejected on ARMv8; `pc`
-                        // is the same register under the name the encoder will
-                        // take.
-                        if *n == 15 {
-                            out.push_str("pc");
-                        } else {
-                            out.push_str(&format!("r{n}"));
-                        }
-                    } else if let Some((kind, n)) = self.vfp_aliases.get(&word) {
-                        out.push_str(&format!("{kind}{n}"));
-                    } else if let Some(n) = self.fpa_aliases.get(&word) {
-                        // Reduced to the architectural spelling; which VFP
-                        // register it becomes depends on the instruction's
-                        // precision, which only the FPA translation knows.
-                        out.push_str(&format!("f{n}"));
-                    } else {
-                        out.push_str(&word);
+                    match self.resolve_name(&word, line) {
+                        Some(text) => out.push_str(&text),
+                        None => out.push_str(&word),
                     }
                 }
                 c => {
@@ -1610,6 +1637,15 @@ impl<'a> Expander<'a> {
             }
         };
         self.map_counter = v;
+        // `MAP expr,Rn` makes every symbol a following FIELD defines relative
+        // to Rn, until the next MAP says otherwise.
+        self.map_base = parts.get(1).and_then(|r| {
+            r.trim()
+                .trim_start_matches(['R', 'r'])
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n < 16)
+        });
         self.set_builtin_at();
         Ok(())
     }
@@ -1626,6 +1662,11 @@ impl<'a> Expander<'a> {
             let name = strip_bars(&self.expand_text(label));
             if !name.is_empty() {
                 self.syms.define_absolute(&name, self.map_counter);
+                // Under a `MAP expr,Rn` the symbol is an offset from Rn, not
+                // an address, and `ADR` on it has to say so.
+                if let Some(base) = self.map_base {
+                    self.field_bases.insert(name.clone(), base);
+                }
             }
         }
         self.map_counter = self.map_counter.wrapping_add(size);

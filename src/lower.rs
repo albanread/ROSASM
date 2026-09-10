@@ -319,23 +319,55 @@ pub fn is_swi(mnemonic: &str) -> bool {
     rest.is_empty() || is_condition(rest)
 }
 
-/// `ADR` is a pseudo-instruction too: an `ADD` or `SUB` against `pc`. LLVM
-/// knows the name but would resolve the label itself, and it cannot -- the
-/// labels are ours, and the address is an offset within an AOF area.
+/// `ADR` is a pseudo-instruction too: an `ADD` or `SUB` against `pc`, or a
+/// `MOV` where the expression is just a number. LLVM knows the name but would
+/// resolve the label itself, and it cannot -- the labels are ours, and the
+/// address is an offset within an AOF area.
 pub fn is_adr(mnemonic: &str) -> bool {
     let up = mnemonic.to_ascii_uppercase();
-    up.starts_with("ADR") && !up.starts_with("ADRL")
+    let Some(rest) = up.strip_prefix("ADR") else { return false };
+    rest.is_empty() || is_condition(rest)
 }
 
 /// `ADRL` has no UAL equivalent: it is an Acorn pseudo-instruction standing
 /// for a pair of instructions that between them reach further than `ADR`.
 /// The encoder never sees it.
+///
+/// It is written two ways. UAL puts the condition last, `ADRLEQ`; pre-UAL puts
+/// it in the middle, `ADREQL`, and the corpus has 547 of those against 2,205
+/// plain ones. Reading only the UAL spelling would take `ADREQL` for an `ADR`
+/// -- wrong instruction, and wrong size, because an `ADRL` is always two.
+///
+/// The two shapes never collide: `ADRLE` is `ADR` conditional on `LE`, because
+/// `LE` is a condition and `E` is not, while `ADRLEL` can only be the long
+/// form with the same condition.
 pub fn is_adrl(mnemonic: &str) -> bool {
     let up = mnemonic.to_ascii_uppercase();
-    up.starts_with("ADRL")
+    let Some(rest) = up.strip_prefix("ADR") else { return false };
+    if is_condition(rest) {
+        return false;
+    }
+    rest == "L"
+        || rest.strip_prefix('L').is_some_and(is_condition)
+        || rest.strip_suffix('L').is_some_and(is_condition)
 }
 
-/// A whole instruction, lowered.
+/// The condition on an `ADR` or `ADRL`, under either spelling.
+pub fn adr_condition(mnemonic: &str) -> String {
+    let up = mnemonic.to_ascii_uppercase();
+    let Some(rest) = up.strip_prefix("ADR") else { return String::new() };
+    if rest.is_empty() || rest == "L" {
+        return String::new();
+    }
+    for c in [rest, rest.strip_prefix('L').unwrap_or(""), rest.strip_suffix('L').unwrap_or("")] {
+        if is_condition(c) {
+            return canonical_condition(c);
+        }
+    }
+    String::new()
+}
+
+/// A whole instruction, lowered./// A whole instruction, lowered.
 pub fn lower_instruction(
     mnemonic: &str,
     operands: &str,
@@ -443,6 +475,35 @@ mod tests {
         assert_eq!(local_label_name("Copy", 10), ".L_Copy_10");
         assert_eq!(local_label_name("", 10), ".L_10");
         assert_ne!(local_label_name("A", 1), local_label_name("B", 1));
+    }
+
+    #[test]
+    fn both_adrl_spellings_are_recognised() {
+        // UAL puts the condition last, pre-UAL in the middle.
+        for m in ["ADRL", "ADRLEQ", "ADREQL", "ADRCSL", "ADRLOL", "ADRLEL"] {
+            assert!(is_adrl(m), "{m} is the long form");
+            assert!(!is_adr(m), "{m} is not the short one");
+        }
+        for m in ["ADR", "ADREQ", "ADRLE", "ADRLS", "ADRLO"] {
+            assert!(is_adr(m), "{m} is the short form");
+            assert!(!is_adrl(m), "{m} is not the long one");
+        }
+        assert!(!is_adr("ADD") && !is_adrl("ADD"));
+    }
+
+    #[test]
+    fn the_adr_condition_is_read_from_either_spelling() {
+        assert_eq!(adr_condition("ADR"), "");
+        assert_eq!(adr_condition("ADRL"), "");
+        assert_eq!(adr_condition("ADREQ"), "EQ");
+        assert_eq!(adr_condition("ADRLEQ"), "EQ");
+        assert_eq!(adr_condition("ADREQL"), "EQ");
+        // `LE` is the condition here, not a stray L.
+        assert_eq!(adr_condition("ADRLE"), "LE");
+        assert_eq!(adr_condition("ADRLEL"), "LE");
+        // And the alternate spellings canonicalise.
+        assert_eq!(adr_condition("ADRLOL"), "CC");
+        assert_eq!(adr_condition("ADRHSL"), "CS");
     }
 
     #[test]
