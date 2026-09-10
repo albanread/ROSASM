@@ -103,61 +103,60 @@ pub fn as_arm_immediate(v: u32) -> Option<(u32, u32)> {
 /// Either way, a value whose bits are spread too widely for the chosen end
 /// leaves a remainder no single field can hold, and the other end is tried.
 pub fn split_immediates(v: u32, max_parts: usize) -> Option<Vec<u32>> {
-    split_from_top(v, max_parts).or_else(|| split_from_bottom(v, max_parts))
-}
-
-/// The same, for an offset the linker will supply. No different: the
-/// relocated pairs follow the same rule as the rest.
-pub fn split_immediates_relocated(v: u32, max_parts: usize) -> Option<Vec<u32>> {
-    split_immediates(v, max_parts)
-}
-
-/// Highest field first, which is what ObjAsm writes.
-fn split_from_top(mut v: u32, max_parts: usize) -> Option<Vec<u32>> {
     if v == 0 {
         return Some(vec![0]);
     }
-    let mut parts = Vec::new();
-    while v != 0 {
-        if parts.len() == max_parts {
-            return None;
-        }
-        // The last part has to take everything that is left.
-        if parts.len() + 1 == max_parts {
-            as_arm_immediate(v)?;
-            parts.push(v);
-            break;
-        }
-        // Round the highest set bit down to an even position, since the
-        // rotation is by an even number of bits, and take the eight bits
-        // from there.
-        let high = (31 - v.leading_zeros()) & !1;
-        let part = v & (0xFFu32 << high);
-        parts.push(part);
-        v &= !part;
+    if max_parts <= 1 {
+        return as_arm_immediate(v).is_some().then(|| vec![v]);
     }
-    Some(parts)
+    // Three hundred and forty `ADR` pairs in ObjAsm's own objects say which
+    // end it starts from, and it is not always the same end: an offset that
+    // is a multiple of four is built from the top down, and one that is not
+    // is built from the bottom up. `&74` comes out `#&40` then `#&34`, and
+    // `&8A` comes out `#&8A` then nothing.
+    let first = if v % 4 == 0 { top_field(v) } else { bottom_field(v) };
+    let rest = v - first;
+    if rest == 0 {
+        return Some(vec![first]);
+    }
+    let mut out = vec![first];
+    out.extend(split_immediates(rest, max_parts - 1)?);
+    Some(out)
 }
 
-/// Lowest field first, which needs the fewest parts.
-fn split_from_bottom(mut v: u32, max_parts: usize) -> Option<Vec<u32>> {
-    if v == 0 {
-        return Some(vec![0]);
-    }
-    let mut parts = Vec::new();
-    while v != 0 {
-        if parts.len() == max_parts {
-            return None;
+/// The eight-bit field holding the highest set bit, dropped to a lower
+/// rotation while what it leaves behind will not fit one field of its own.
+///
+/// ADFSFiler is where this shows: `&34F4` taken at the highest rotation is
+/// `#&3000`, leaving `&4F4`, which no single field holds. One rotation down
+/// takes `#&3400` and leaves `&F4`, which is what ObjAsm writes.
+fn top_field(v: u32) -> u32 {
+    let top = (v.bit_length_even()) as u32;
+    let mut s = top;
+    loop {
+        let field = v & (0xFFu32 << s);
+        if as_arm_immediate(v - field).is_some() || s == 0 {
+            return field;
         }
-        let low = v.trailing_zeros() & !1;
-        let part = v & (0xFF << low);
-        if part == 0 {
-            return None;
-        }
-        parts.push(part);
-        v &= !part;
+        s -= 2;
     }
-    Some(parts)
+}
+
+/// The eight-bit field holding the lowest set bit.
+fn bottom_field(v: u32) -> u32 {
+    v & (0xFF << ((v.trailing_zeros()) & !1))
+}
+
+trait BitLengthEven {
+    fn bit_length_even(self) -> u32;
+}
+
+impl BitLengthEven for u32 {
+    /// The position of the highest set bit, rounded down to an even one --
+    /// which is where an eight-bit field may start.
+    fn bit_length_even(self) -> u32 {
+        (31 - self.leading_zeros()) & !1
+    }
 }
 
 /// Expand `ADRL Rd, target` into the instructions ObjAsm would generate.
@@ -188,12 +187,8 @@ fn add_or_sub(
     } else {
         ("SUB", (-delta) as u32)
     };
-    let split = if relocated {
-        split_immediates_relocated
-    } else {
-        split_immediates
-    };
-    let Some(parts) = split(mag, count) else {
+    let _ = relocated;
+    let Some(parts) = split_immediates(mag, count) else {
         return Legalized::Unsupported(if count == 1 {
             format!("offset {delta} does not fit one instruction; ADRL reaches further")
         } else {

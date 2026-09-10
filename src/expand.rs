@@ -456,6 +456,13 @@ struct Literal {
     /// The area of the instruction that asked for it. A pool in another area
     /// is not at a fixed distance, so that is an error rather than a fixup.
     area: usize,
+    /// Whether anything ended up loading from it.
+    ///
+    /// Pass one reserves a word for a value it cannot see; pass two may find
+    /// the value fits an instruction and load it with one, leaving the word
+    /// reserved but unread. ObjAsm leaves such a word zero rather than
+    /// filling in a value nothing asks for.
+    used: bool,
 }
 
 /// Can an `LDR` at `here` reach a word at `there`?
@@ -2706,7 +2713,7 @@ impl<'a> Expander<'a> {
                 LiteralRef::Placed(at) => (!loadable).then_some(at),
                 LiteralRef::Pending(pool, offset) => {
                     // Re-reserve it so the pool still knows its own size.
-                    self.reserve_literal(&expr, area, Some(offset));
+                    self.reserve_literal(&expr, area, Some(offset), !loadable);
                     if loadable {
                         return None;
                     }
@@ -2746,7 +2753,7 @@ impl<'a> Expander<'a> {
             self.literal_sites.push(Some(LiteralRef::Placed(at)));
             return Some(at);
         }
-        let offset = self.reserve_literal(&expr, area, None);
+        let offset = self.reserve_literal(&expr, area, None, true);
         self.literal_sites
             .push(Some(LiteralRef::Pending(self.pools.len(), offset)));
         // The pool has not been placed yet in this pass, so there is no
@@ -2756,9 +2763,11 @@ impl<'a> Expander<'a> {
 
     /// Find or make room for a literal in the pool being filled, returning its
     /// offset within that pool.
-    fn reserve_literal(&mut self, expr: &str, area: usize, at: Option<u32>) -> u32 {
+    fn reserve_literal(&mut self, expr: &str, area: usize, at: Option<u32>, used: bool) -> u32 {
         let expr = expr.trim();
-        if let Some(l) = self.pending_literals.iter().find(|l| l.expr == expr) {
+        if let Some(l) = self.pending_literals.iter_mut().find(|l| l.expr == expr) {
+            // One site may load it from the pool while another does not.
+            l.used |= used;
             return l.offset;
         }
         let offset = at.unwrap_or_else(|| 4 * self.pending_literals.len() as u32);
@@ -2766,6 +2775,7 @@ impl<'a> Expander<'a> {
             expr: expr.to_string(),
             offset,
             area,
+            used,
         });
         offset
     }
@@ -2794,6 +2804,8 @@ impl<'a> Expander<'a> {
                 );
             }
             let v = match self.eval_expr(&l.expr) {
+                // A word nothing reads is left as it was reserved.
+                _ if !l.used => 0,
                 Ok(Value::Arith(n)) => n,
                 // Not an error: an imported symbol has no value here, and the
                 // relocation below is what supplies it.
