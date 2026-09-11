@@ -806,11 +806,26 @@ fn main() {
     // import, becomes an external reference for the linker to satisfy.
     let defs = ex.label_defs();
     let mut symbols: Vec<aof::Symbol> = Vec::new();
+    // The spec: bit 8 "denotes that the symbol identifies a (usually
+    // read-only) datum, rather than an executable instruction", and is
+    // meaningful only inside a code area. ObjAsm decides it by what it was
+    // doing where the label was written.
+    let kinds = ex.label_kinds();
+    let datum = |name: &String, ai: usize| {
+        let code = areas
+            .get(ai)
+            .is_some_and(|a| a.attributes & area_attr::CODE != 0);
+        if code && kinds.get(name).copied().unwrap_or(false) {
+            sym_attr::CODE_DATUM
+        } else {
+            0
+        }
+    };
     for name in ex.exports() {
         match defs.get(name) {
             Some((ai, off)) => symbols.push(aof::Symbol {
                 name: name.clone(),
-                attributes: sym_attr::DEFINED | sym_attr::GLOBAL,
+                attributes: sym_attr::DEFINED | sym_attr::GLOBAL | datum(name, *ai),
                 value: *off,
                 area: areas.get(*ai).map(|a| a.name.clone()),
             }),

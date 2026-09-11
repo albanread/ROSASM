@@ -380,6 +380,18 @@ pub struct Expander<'a> {
     field_bases: std::collections::HashMap<String, u32>,
     /// How many macro expansions there have been, for naming them apart.
     expansions: usize,
+    /// Whether the last thing placed in this area was data.
+    ///
+    /// The AOF spec: bit 8 of a symbol's attributes "encodes the <code datum>
+    /// attribute ... It denotes that the symbol identifies a (usually
+    /// read-only) datum, rather than an executable instruction." ObjAsm
+    /// decides that by what it was doing when the label was defined, so a
+    /// label after a string or a table is a datum and one after an
+    /// instruction is not. `ROUT` says a routine starts here, which is code
+    /// whatever came before it.
+    in_data: bool,
+    /// The kind in force where each label was defined.
+    label_kinds: std::collections::HashMap<String, bool>,
     /// Labels standing at the current address that have emitted nothing.
     ///
     /// A label with no bytes of its own belongs to whatever comes next, so
@@ -735,6 +747,8 @@ impl<'a> Expander<'a> {
             map_base: None,
             field_bases: std::collections::HashMap::new(),
             expansions: 0,
+            in_data: false,
+            label_kinds: std::collections::HashMap::new(),
             fresh_labels: Vec::new(),
             fresh_locals: Vec::new(),
             pending_literals: Vec::new(),
@@ -1067,6 +1081,11 @@ impl<'a> Expander<'a> {
     /// Where each label ended up: (area index, offset within that area).
     pub fn label_defs(&self) -> &std::collections::HashMap<String, (usize, u32)> {
         &self.label_defs
+    }
+
+    /// Which labels name a datum rather than an instruction.
+    pub fn label_kinds(&self) -> &std::collections::HashMap<String, bool> {
+        &self.label_kinds
     }
 
     /// Names declared `EXPORT` or `GLOBAL`.
@@ -2406,6 +2425,9 @@ impl<'a> Expander<'a> {
     /// The label is an ordinary label as well as the scope's name: the
     /// sources routinely write `Go ROUT` and then `BL Go` from elsewhere.
     fn do_rout(&mut self, line: &Line) {
+        // A routine starts here, so what follows is code however the area
+        // arrived at this point.
+        self.in_data = false;
         self.define_label(line);
         // Substituted, because the label is almost always a macro parameter:
         // `Entry` writes `$label ROUT`, and 3,493 routines in the corpus are
@@ -2452,6 +2474,12 @@ impl<'a> Expander<'a> {
                 self.syms.define_absolute(&name, 0);
                 self.label_defs.insert(name.clone(), (index, 0));
                 self.area = Some(layout::Area { name, attrs, offset });
+                // A new area starts with nothing behind it, so a label at
+                // the top of one is not standing after data: scheduler puts
+                // `Pollword_PreEmpted` first in `RO$$Code` and ObjAsm does
+                // not call it a datum, while the labels on the words after
+                // it are.
+                self.in_data = false;
                 self.settle_labels();
                 self.set_builtin_dot();
                 Ok(())
@@ -2535,6 +2563,7 @@ impl<'a> Expander<'a> {
         if let Some(n) = reserved {
             area.offset = area.offset.wrapping_add(n);
             if n != 0 {
+                self.in_data = true;
                 self.settle_labels();
             }
             self.set_builtin_dot();
@@ -2579,7 +2608,10 @@ impl<'a> Expander<'a> {
                 area.offset = area.offset.wrapping_add(4 * fpa_words.unwrap_or(1))
             }
             // Anything else that reaches here is an ARM instruction.
-            _ => area.offset = area.offset.wrapping_add(4),
+            _ => {
+                area.offset = area.offset.wrapping_add(4);
+                self.in_data = false;
+            }
         }
         // Past this line's bytes, so any label on it is no longer waiting for
         // something to belong to.
@@ -3100,6 +3132,7 @@ impl<'a> Expander<'a> {
                 // what makes a forward reference come out right.
                 let area = self.current_area_index();
                 self.label_defs.insert(name.clone(), (area, addr));
+                self.label_kinds.insert(name.clone(), self.in_data);
                 self.fresh_labels.push(name);
             }
         }
