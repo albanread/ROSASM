@@ -132,6 +132,7 @@ fn to_ual(
     ex: &Expander,
     refused: &mut Vec<Unencodable>,
     allow: bool,
+    fpa_to_vfp: bool,
 ) -> (String, Vec<usize>, Vec<AdrReloc>) {
     // The directives have to agree with the command line, and they win where
     // they disagree: `.fpu neon` is VFPv3 and would refuse the A72's fused
@@ -204,6 +205,7 @@ fn to_ual(
             here: l.addr,
             target: adr_target(op, &operands, l, ex),
             relocated: external.is_some(),
+            fpa_to_vfp,
         };
         match legalize::legalize(op, &operands, &ctx) {
             Legalized::One(m, o) => s.push_str(&format!("        {m} {o}\n")),
@@ -524,6 +526,7 @@ fn main() {
     let mut map: Option<PathBuf> = None;
     let mut warn_assertions = false;
     let mut allow_unencodable = false;
+    let mut fpa_to_vfp = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -551,6 +554,10 @@ fn main() {
             // a ROM can be built with, so saying so is the default. This
             // asks for one anyway, with every gap trapping at run time.
             "--allow-unencodable" => allow_unencodable = true,
+            // Not for building this ROM, where FPEmulator reads the FPA word
+            // back and interprets it. For asking what the sources would look
+            // like against the floating point the hardware has.
+            "--fpa-to-vfp" => fpa_to_vfp = true,
             "--map" => {
                 i += 1;
                 map = args.get(i).map(PathBuf::from);
@@ -562,7 +569,7 @@ fn main() {
     let (Some(source), Some(out)) = (source, out) else {
         eprintln!(
             "usage: rosasm <source> -o <object> [-I dir]... [-PD assignment]... \
-             [--map file] [--warn-assertions] [--allow-unencodable] [--keep-temps]"
+             [--map file] [--warn-assertions] [--allow-unencodable]              [--fpa-to-vfp] [--keep-temps]"
         );
         std::process::exit(2);
     };
@@ -641,7 +648,8 @@ fn main() {
     // Everything the object cannot honestly contain, collected rather
     // than printed and forgotten.
     let mut refused: Vec<Unencodable> = Vec::new();
-    let (ual, index, adr_relocs) = to_ual(&lines, &ex, &mut refused, allow_unencodable);
+    let (ual, index, adr_relocs) =
+        to_ual(&lines, &ex, &mut refused, allow_unencodable, fpa_to_vfp);
     let tmp = std::env::temp_dir().join(format!("rosasm-{}", std::process::id()));
     let asm_path = tmp.with_extension("s");
     let obj_path = tmp.with_extension("o");

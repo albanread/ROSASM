@@ -47,6 +47,21 @@ pub struct Context {
     /// Whether the target is a symbol the linker has to supply, which
     /// changes how ObjAsm splits the offset between the two instructions.
     pub relocated: bool,
+    /// Translate the FPA instruction set into VFP instead of encoding it.
+    ///
+    /// Not what building this ROM wants: nothing executes an FPA instruction
+    /// here, FPEmulator reads the word back and interprets it, so the word
+    /// has to be the one the source asked for. The translation is for the
+    /// other question -- what RISC OS would look like using the floating
+    /// point the hardware actually has -- which is a change to the sources,
+    /// made deliberately, and this is how it can be tried against them.
+    pub fpa_to_vfp: bool,
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self { here: 0, target: None, relocated: false, fpa_to_vfp: false }
+    }
 }
 
 /// The three kinds of expression `ADR` accepts, from the manual: "The
@@ -379,6 +394,11 @@ pub fn legalize(mnemonic: &str, operands: &str, ctx: &Context) -> Legalized {
     // back out of the instruction stream as data and interprets it. So the
     // word is emitted as the source asked for it, bit for bit, rather than
     // translated into something else that would never be read.
+    if ctx.fpa_to_vfp {
+        if let Some(l) = crate::fpa::convert(&up, operands) {
+            return l;
+        }
+    }
     if let Some(l) = crate::fpa::encode(&up, operands) {
         return l;
     }
@@ -541,7 +561,7 @@ mod tests {
 
     #[test]
     fn an_adr_with_no_known_target_is_reported() {
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         assert!(matches!(
             legalize("ADR", "r0, Somewhere", &ctx),
             Legalized::Unsupported(_)
@@ -550,14 +570,14 @@ mod tests {
 
     #[test]
     fn an_adrl_with_no_known_target_is_reported() {
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         let l = legalize("ADRL", "r0, Somewhere", &ctx);
         assert!(matches!(l, Legalized::Unsupported(_)));
     }
 
     #[test]
     fn an_ldr_of_a_small_literal_becomes_a_move() {
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         assert_eq!(
             legalize("LDR", "r0, =0x10", &ctx),
             Legalized::One("MOV".into(), "r0, #16".into())
@@ -571,7 +591,7 @@ mod tests {
 
     #[test]
     fn an_ldr_of_a_complemented_literal_becomes_mvn() {
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         // -1 is not an immediate; its complement, 0, is.
         assert_eq!(
             legalize("LDR", "r0, =0xFFFFFFFF", &ctx),
@@ -581,7 +601,7 @@ mod tests {
 
     #[test]
     fn an_ldr_needing_a_pool_says_so() {
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         match legalize("LDR", "r0, =0x12345678", &ctx) {
             Legalized::Unsupported(why) => assert!(why.contains("literal pool"), "{why}"),
             other => panic!("expected a refusal, got {other:?}"),
@@ -591,7 +611,7 @@ mod tests {
     #[test]
     fn a_numeric_adr_moves_rather_than_adds() {
         // "Numeric: MOV|MVN register,#constant will be produced."
-        let ctx = |v| Context { here: 0, target: Some(AdrTarget::Numeric(v)), relocated: false };
+        let ctx = |v| Context { here: 0, target: Some(AdrTarget::Numeric(v)), relocated: false, fpa_to_vfp: false };
         assert_eq!(
             legalize("ADR", "r5, 44", &ctx(44)),
             Legalized::One("MOV".into(), "r5, #44".into())
@@ -611,7 +631,7 @@ mod tests {
     #[test]
     fn a_numeric_adrl_builds_the_word_in_two_halves() {
         // MOV32, which is MOVW then MOVT, and always two instructions.
-        let ctx = Context { here: 0, target: Some(AdrTarget::Numeric(0x1234_5678)), relocated: false };
+        let ctx = Context { here: 0, target: Some(AdrTarget::Numeric(0x1234_5678)), relocated: false, fpa_to_vfp: false };
         let Legalized::Many(v) = legalize("ADRL", "r6, x", &ctx) else {
             panic!("expected two instructions")
         };
@@ -626,6 +646,7 @@ mod tests {
             here: 0,
             target: Some(AdrTarget::Register { base: 9, offset: 4 }),
             relocated: false,
+            fpa_to_vfp: false,
         };
         assert_eq!(
             legalize("ADR", "r4, Slot", &ctx),
@@ -641,6 +662,7 @@ mod tests {
             here: 0,
             target: Some(AdrTarget::Register { base: 12, offset: -8 }),
             relocated: false,
+            fpa_to_vfp: false,
         };
         assert_eq!(
             legalize("ADR", "r1, area1", &ctx),
@@ -652,7 +674,7 @@ mod tests {
     fn the_pre_ual_adrl_spelling_gets_two_instructions_and_its_condition() {
         // `ADREQL` is ADRL conditional on EQ, and must not be read as ADR --
         // that would be one instruction where the layout counted two.
-        let ctx = Context { here: 8, target: Some(AdrTarget::Program(44)), relocated: false };
+        let ctx = Context { here: 8, target: Some(AdrTarget::Program(44)), relocated: false, fpa_to_vfp: false };
         let Legalized::Many(v) = legalize("ADREQL", "r2, Msg", &ctx) else {
             panic!("expected two instructions")
         };
@@ -670,7 +692,7 @@ mod tests {
         // pair is a placeholder the linker rewrites, and ObjAsm writes the
         // field holding the highest set bit first: `SUB ip, pc, #&20` /
         // `SUB ip, ip, #&C` for a distance of &2C.
-        let ctx = Context { here: 0x24, target: Some(AdrTarget::Program(0)), relocated: true };
+        let ctx = Context { here: 0x24, target: Some(AdrTarget::Program(0)), relocated: true, fpa_to_vfp: false };
         let Legalized::Many(v) = legalize("ADRL", "ip, Imported", &ctx) else {
             panic!("expected two instructions")
         };
@@ -684,7 +706,7 @@ mod tests {
         // built: the comparison with its `S` bit and `pc` for a destination,
         // which is what made it write the PSR. IICMod's `TEQP R2, #0` is
         // &E332F000 in ObjAsm's object.
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         assert_eq!(legalize("TEQP", "r2, #0", &ctx), Legalized::RawWord(0xE332_F000));
         assert_eq!(legalize("TEQP", "pc, lr", &ctx), Legalized::RawWord(0xE13F_F00E));
         assert_eq!(legalize("TSTP", "r0, #1", &ctx), Legalized::RawWord(0xE310_F001));
@@ -694,7 +716,7 @@ mod tests {
 
     #[test]
     fn a_psr_form_may_carry_a_condition() {
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         assert_eq!(legalize("TEQNEP", "r2, #0", &ctx), Legalized::RawWord(0x1332_F000));
         assert_eq!(legalize("TEQPNE", "r2, #0", &ctx), Legalized::RawWord(0x1332_F000));
     }
@@ -705,7 +727,7 @@ mod tests {
         // trap and FPEmulator reads it back as data, so what goes in the
         // object is what the source asked for -- checked against ObjAsm's
         // own objects.
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         assert_eq!(legalize("RFS", "r1", &ctx), Legalized::RawWord(0xEE30_1110));
         assert_eq!(legalize("WFS", "r1", &ctx), Legalized::RawWord(0xEE20_1110));
         assert_eq!(
@@ -720,7 +742,7 @@ mod tests {
 
     #[test]
     fn a_braceless_register_list_gets_its_braces() {
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         assert_eq!(
             legalize("VPUSH", "d8", &ctx),
             Legalized::One("VPUSH".into(), "{d8}".into())
@@ -734,7 +756,7 @@ mod tests {
 
     #[test]
     fn swp_is_reported_as_deprecated() {
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         assert!(matches!(
             legalize("SWP", "r0, r1, [r2]", &ctx),
             Legalized::Unsupported(_)
@@ -743,7 +765,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_instruction_passes_through_normalised() {
-        let ctx = Context { here: 0, target: None, relocated: false };
+        let ctx = Context { here: 0, target: None, relocated: false, fpa_to_vfp: false };
         assert_eq!(
             legalize("SUBNES", "r1, r1, #1", &ctx),
             Legalized::One("SUBSNE".into(), "r1, r1, #1".into())
