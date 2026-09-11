@@ -3269,8 +3269,12 @@ impl<'a> Expander<'a> {
             self.advance(&relexed);
             let mut bytes = self.data_bytes(&relexed);
             let up = relexed.opcode_str().unwrap_or("").to_ascii_uppercase();
-            // ALIGN pads to the boundary, and ObjAsm lists the pad bytes.
-            if up == "ALIGN" {
+            // `ALIGN` pads to the boundary and `SPACE` reserves a run, and
+            // both put those bytes in the object: a gap the location counter
+            // knows about and the data does not moves everything after it.
+            // Touch reserves twelve bytes in the middle of a device block,
+            // and its table came out three words early.
+            if up == "ALIGN" || up == "SPACE" || up == "%" {
                 let after = self.area.as_ref().map(|a| a.offset).unwrap_or(addr);
                 bytes = vec![0u8; after.saturating_sub(addr) as usize];
             }
@@ -4431,6 +4435,23 @@ mod automatic_alignment_tests {
             "        END",
         ]);
         assert_eq!(got, vec![1, 0, 3, 2, 4]);
+    }
+
+    /// Touch reserves twelve bytes in the middle of a device block and then
+    /// carries on with the block's words. They have to be in the object, not
+    /// only in the counter, or everything after arrives three words early.
+    #[test]
+    fn space_reserves_its_bytes_in_the_object() {
+        let got = bytes(&[
+            "        AREA    x, DATA",
+            "        DCD     &11111111",
+            "        %       8",
+            "        DCD     &22222222",
+            "        END",
+        ]);
+        assert_eq!(got.len(), 16);
+        assert_eq!(&got[4..12], &[0u8; 8]);
+        assert_eq!(&got[12..], &[0x22, 0x22, 0x22, 0x22]);
     }
 
     #[test]
