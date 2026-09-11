@@ -941,7 +941,11 @@ fn main() {
                 field: aof::FieldType::Instruction,
                 pc_relative: true,
                 based: false,
-                max_instructions: 1,
+                // How many instructions the linker may rewrite. One is
+                // written as none: ObjAsm's objects hold a hundred and
+                // eighty-six instruction relocations with the field clear
+                // and nine `ADRL`s with it at two, and never a one.
+                max_instructions: 0,
             });
         }
     }
@@ -961,7 +965,8 @@ fn main() {
             field: aof::FieldType::Instruction,
             pc_relative: true,
             based: false,
-            max_instructions: a.instructions,
+            // As above: a single instruction is written as none.
+            max_instructions: if a.instructions > 1 { a.instructions } else { 0 },
         });
     }
 

@@ -222,10 +222,21 @@ fn compare(ours: &aof::Object, theirs: &aof::Object, limit: usize) -> Vec<String
         }
     }
 
-    // --- symbols, by name ------------------------------------------------
-    let find = |o: &aof::Object, n: &str| o.symbols.iter().find(|s| s.name == n).cloned();
+    // --- symbols, by name and by which of that name ----------------------
+    //
+    // `$a` and `$d` repeat: an object has one at every point its content
+    // changes between code and data. Matching on the name alone compares
+    // every one of ours against the first of theirs, which reads as a
+    // difference at every boundary after the first when nothing is wrong.
+    let nth = |o: &aof::Object, n: &str, k: usize| {
+        o.symbols.iter().filter(|s| s.name == n).nth(k).cloned()
+    };
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for s in &ours.symbols {
-        match find(theirs, &s.name) {
+        let k = seen.entry(s.name.as_str()).or_insert(0);
+        let which = *k;
+        *k += 1;
+        match nth(theirs, &s.name, which) {
             None => say(format!("symbol {}: only ours", s.name)),
             Some(t) => {
                 if s.value != t.value {
