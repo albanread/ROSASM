@@ -285,6 +285,12 @@ def objasm(sh, unit, predefines, extra_i, variables, hdrdirs):
             time.sleep(0.2)
         if os.path.isfile(path):
             return path, out
+    # No object and the log says nothing: whatever went wrong went to the
+    # screen instead, which the redirection does not capture. The Kernel
+    # comes back with the banner and nothing else, and the reason has to
+    # be somewhere.
+    if screen.strip() and screen.strip() not in out:
+        out = (out or "").rstrip() + chr(10) + "[screen] " + screen.strip()
     return None, out
 
 
