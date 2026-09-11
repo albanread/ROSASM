@@ -212,7 +212,7 @@ def main():
         lines.append("")
         lines.append(
             f"instructions with no equivalent on this target "
-            f"({sum(unsupported.values())} in all, each a zero word):"
+            f"({sum(unsupported.values())} in all, each of which will trap):"
         )
         for m, n in unsupported.most_common(20):
             lines.append(f"  {n:5d}  {m}")
