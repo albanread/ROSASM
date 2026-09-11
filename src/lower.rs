@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 /// ARM condition codes, longest-match irrelevant since all are two characters.
-const CONDS: [&str; 16] = [
+pub const CONDS: [&str; 16] = [
     "EQ", "NE", "CS", "CC", "MI", "PL", "VS", "VC", "HI", "LS", "GE", "LT", "GT", "LE", "AL", "NV",
 ];
 /// Conditions with an alternative spelling; both appear in the corpus.
@@ -98,14 +98,31 @@ fn canonical_condition(c: &str) -> String {
         .unwrap_or_else(|| c.to_string())
 }
 
-/// Is this a 26-bit PSR-writing form with no UAL equivalent? `TEQP`, `TSTP`,
-/// `CMPP` and `CMNP` wrote the flags directly on a 26-bit ARM; the encoder
-/// rejects them outright.
-pub fn is_psr_form(m: &str) -> bool {
+/// The condition on a 26-bit PSR-writing form, if that is what this is.
+///
+/// `TEQP`, `TSTP`, `CMPP` and `CMNP` set the flags directly on a 26-bit ARM,
+/// and the sources write the condition on either side of the `P`: `TEQNEP`
+/// and `TEQPLS` both occur.
+///
+/// Which makes the spelling ambiguous, and reading it as a `P` first gets it
+/// wrong: `CMPPL` is a comparison on PL, and `TEQPLS` is one on PL with the
+/// redundant `S`. A remainder that is a condition in its own right is read
+/// that way, and only what is left over is a PSR form.
+pub fn psr_condition(m: &str) -> Option<String> {
     let up = m.to_ascii_uppercase();
-    COMPARE_FORMS
-        .iter()
-        .any(|s| up.strip_prefix(s).is_some_and(|r| r.starts_with('P')))
+    let stem = COMPARE_FORMS.iter().find(|s| up.starts_with(*s))?;
+    let rest = &up[stem.len()..];
+    let body = rest.strip_suffix('S').unwrap_or(rest);
+    if body.is_empty() || is_condition(body) {
+        return None;
+    }
+    let cond = rest.strip_prefix('P').or_else(|| rest.strip_suffix('P'))?;
+    (cond.is_empty() || is_condition(cond)).then(|| canonical_condition(cond))
+}
+
+/// Is this a 26-bit PSR-writing form?
+pub fn is_psr_form(m: &str) -> bool {
+    psr_condition(m).is_some()
 }
 
 /// Rewrite one mnemonic into UAL order. Returns None if it needs no change.
@@ -129,7 +146,7 @@ pub fn normalise_mnemonic(m: &str) -> Option<String> {
     for stem in COMPARE_FORMS {
         let Some(rest) = up.strip_prefix(stem) else { continue };
         // `TEQP` and friends set the PSR in 26-bit mode and have no UAL form.
-        if rest.starts_with('P') {
+        if psr_condition(&up).is_some() {
             return None;
         }
         let stripped = match rest {

@@ -222,6 +222,72 @@ pub fn expand_adr(cond: &str, rd: &str, here: u32, target: u32) -> Legalized {
     add_or_sub(cond, rd, "pc", target as i64 - (here as i64 + 8), 1, false)
 }
 
+/// `TEQP Rn, op2` and its family, as the word ObjAsm writes.
+///
+/// These set the PSR directly on a 26-bit ARM: the comparison with its `S`
+/// bit and `pc` as the destination register. No UAL spelling exists and the
+/// encoder will not take one, so the word is built here -- the sources use
+/// them a hundred and fifty-eight times, and every one was becoming a zero
+/// word that no processor would have executed.
+fn psr_form(up: &str, operands: &str) -> Legalized {
+    let stem = &up[..3];
+    let opcode: u32 = match stem {
+        "TST" => 0b1000,
+        "TEQ" => 0b1001,
+        "CMP" => 0b1010,
+        _ => 0b1011,
+    };
+    // Read where the spelling was decided, so the two agree about which
+    // `P` is the marker and which is half of a condition.
+    let Some(cond) = lower::psr_condition(up).and_then(|c| condition_bits(&c)) else {
+        return Legalized::Unsupported(format!("{up} has no condition I recognise"));
+    };
+    let mut parts = operands.split(',').map(str::trim);
+    let (Some(rn), Some(op2)) = (parts.next(), parts.next()) else {
+        return Legalized::Unsupported(format!("{up} needs a register and an operand"));
+    };
+    if parts.next().is_some() {
+        return Legalized::Unsupported(format!("{up} with a shifted operand"));
+    }
+    let Some(rn) = register_bits(rn) else {
+        return Legalized::Unsupported(format!("{up}: '{rn}' is not a register"));
+    };
+    // `Rd` is `pc`, which is what made it write the PSR.
+    let head = (cond << 28) | (opcode << 21) | (1 << 20) | (rn << 16) | (0xF << 12);
+    if let Some(text) = op2.strip_prefix('#') {
+        let Ok(v) = parse_number(text) else {
+            return Legalized::Unsupported(format!("{up}: '{op2}' is not a number"));
+        };
+        let Some((rot, imm)) = as_arm_immediate(v) else {
+            return Legalized::Unsupported(format!("{up}: {v:#x} is not an ARM immediate"));
+        };
+        return Legalized::RawWord(head | (1 << 25) | (rot << 8) | imm);
+    }
+    match register_bits(op2) {
+        Some(rm) => Legalized::RawWord(head | rm),
+        None => Legalized::Unsupported(format!("{up}: '{op2}' is not a register")),
+    }
+}
+
+/// The four condition bits, or `None` if that is not a condition.
+fn condition_bits(name: &str) -> Option<u32> {
+    if name.is_empty() {
+        return Some(0xE);
+    }
+    lower::CONDS.iter().position(|c| *c == name).map(|i| i as u32)
+}
+
+/// A register's number, by name or by the spellings the encoder uses.
+fn register_bits(name: &str) -> Option<u32> {
+    let n = name.trim().to_ascii_lowercase();
+    match n.as_str() {
+        "pc" => Some(15),
+        "lr" => Some(14),
+        "sp" => Some(13),
+        _ => n.strip_prefix('r')?.parse::<u32>().ok().filter(|v| *v < 16),
+    }
+}
+
 /// A literal already reduced to a number by the expression evaluator.
 fn parse_number(s: &str) -> Result<u32, ()> {
     let s = s.trim();
@@ -346,9 +412,7 @@ pub fn legalize(mnemonic: &str, operands: &str, ctx: &Context) -> Legalized {
     }
 
     if lower::is_psr_form(&up) {
-        return Legalized::Unsupported(format!(
-            "{up} writes the PSR in 26-bit mode and has no 32-bit form"
-        ));
+        return psr_form(&up, operands);
     }
 
     if up.starts_with("SWP") {
@@ -613,14 +677,24 @@ mod tests {
     }
 
     #[test]
-    fn the_26_bit_psr_forms_are_unsupported() {
+    fn the_26_bit_psr_forms_are_encoded_here() {
+        // No UAL spelling and the encoder will not take one, so the word is
+        // built: the comparison with its `S` bit and `pc` for a destination,
+        // which is what made it write the PSR. IICMod's `TEQP R2, #0` is
+        // &E332F000 in ObjAsm's object.
         let ctx = Context { here: 0, target: None, relocated: false };
-        for m in ["TEQP", "TSTP", "CMPP", "CMNP"] {
-            match legalize(m, "r0, #1", &ctx) {
-                Legalized::Unsupported(why) => assert!(why.contains("26-bit"), "{why}"),
-                other => panic!("{m} should be unsupported, got {other:?}"),
-            }
-        }
+        assert_eq!(legalize("TEQP", "r2, #0", &ctx), Legalized::RawWord(0xE332_F000));
+        assert_eq!(legalize("TEQP", "pc, lr", &ctx), Legalized::RawWord(0xE13F_F00E));
+        assert_eq!(legalize("TSTP", "r0, #1", &ctx), Legalized::RawWord(0xE310_F001));
+        assert_eq!(legalize("CMPP", "r1, r2", &ctx), Legalized::RawWord(0xE151_F002));
+        assert_eq!(legalize("CMNP", "r1, #0", &ctx), Legalized::RawWord(0xE371_F000));
+    }
+
+    #[test]
+    fn a_psr_form_may_carry_a_condition() {
+        let ctx = Context { here: 0, target: None, relocated: false };
+        assert_eq!(legalize("TEQNEP", "r2, #0", &ctx), Legalized::RawWord(0x1332_F000));
+        assert_eq!(legalize("TEQPNE", "r2, #0", &ctx), Legalized::RawWord(0x1332_F000));
     }
 
     #[test]
