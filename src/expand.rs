@@ -2622,6 +2622,15 @@ impl<'a> Expander<'a> {
                 }
                 None => t,
             };
+            // A `DCB` of a string variable lays down its characters, the
+            // same as a quoted one: SerialSpt builds its error table from
+            // names a macro has set to `"E01", 0` and the like.
+            if width == 1 {
+                if let Ok(Value::Str(text)) = self.eval_expr(t) {
+                    out.extend(text.bytes());
+                    continue;
+                }
+            }
             let v = match self.eval_expr(t) {
                 Ok(Value::Arith(n)) => {
                     if !identifiers(t).is_empty() {
@@ -2875,10 +2884,18 @@ impl<'a> Expander<'a> {
     /// Two symbols on different registers in one expression have no meaning,
     /// so nothing is inherited from that.
     fn inherit_base(&mut self, name: &str, rhs: &str) {
-        let bases: Vec<u32> = identifiers(rhs)
-            .iter()
-            .filter_map(|n| self.field_bases.get(n).copied())
-            .collect();
+        // `@` is the map's own counter, so a symbol taking its value is as
+        // register-relative as the map is: Taskman writes `GotVectors * @`
+        // inside `^ 0, r12` and then `ADRL r0, GotVectors`.
+        let mut bases: Vec<u32> = Vec::new();
+        if rhs.contains('@') {
+            bases.extend(self.map_base);
+        }
+        bases.extend(
+            identifiers(rhs)
+                .iter()
+                .filter_map(|n| self.field_bases.get(n).copied()),
+        );
         if let Some(b) = bases.first() {
             if bases.iter().all(|x| x == b) {
                 self.field_bases.insert(name.to_string(), *b);
