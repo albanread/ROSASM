@@ -268,6 +268,9 @@ enum Source {
         lines: Vec<Line>,
         pos: usize,
         args: HashMap<String, String>,
+        /// This expansion, told apart from every other. Local labels belong
+        /// to the expansion that wrote them.
+        id: usize,
         /// How many conditionals were open when the macro was entered, so
         /// that `MEXIT` can discard whatever the body opened.
         ///
@@ -375,6 +378,8 @@ pub struct Expander<'a> {
     /// Symbols a `FIELD` defined under such a `MAP`, and the register they are
     /// relative to. `ADR Rd,Sym` on one of these is `ADD Rd,Rn,#offset`.
     field_bases: std::collections::HashMap<String, u32>,
+    /// How many macro expansions there have been, for naming them apart.
+    expansions: usize,
     /// Labels standing at the current address that have emitted nothing.
     ///
     /// A label with no bytes of its own belongs to whatever comes next, so
@@ -634,6 +639,13 @@ struct DataSite {
     rout: Option<String>,
 }
 
+/// The routine part of a local label's scope, without the expansion it was
+/// written in. `%BA10` looks across every macro level, which is to say every
+/// scope belonging to the same routine.
+fn routine_of(scope: &str) -> &str {
+    scope.split(" in expansion ").next().unwrap_or(scope)
+}
+
 /// One local label definition: `10loop` or a bare `10`.
 #[derive(Debug, Clone, PartialEq)]
 struct LocalDef {
@@ -722,6 +734,7 @@ impl<'a> Expander<'a> {
             cp_aliases: std::collections::HashMap::new(),
             map_base: None,
             field_bases: std::collections::HashMap::new(),
+            expansions: 0,
             fresh_labels: Vec::new(),
             fresh_locals: Vec::new(),
             pending_literals: Vec::new(),
@@ -1002,7 +1015,7 @@ impl<'a> Expander<'a> {
                 l.addr = to;
             }
         }
-        let rout = self.rout.clone();
+        let rout = self.local_scope();
         let origin = self.origin(line_num);
         self.out.push(ExpandedLine {
             operands: String::new(),
@@ -1024,7 +1037,7 @@ impl<'a> Expander<'a> {
         self.pad_to(4, line_num);
         let addr = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
         let area_index = self.current_area_index();
-        let rout = self.rout.clone();
+        let rout = self.local_scope();
         let origin = self.origin(line_num);
         let bytes = self.close_pool(line_num)?;
         self.out.push(ExpandedLine {
@@ -1111,14 +1124,19 @@ impl<'a> Expander<'a> {
         } else {
             &self.locals_prev
         };
+        // `%BT10` looks in this macro level only and `%BA10` in all of them;
+        // spinrw writes both, and labels its `MetaLock` invocations with a
+        // `10` the macro itself branches back to. Where the level is not
+        // written, looking outward is what the sources expect.
+        let this_level = r.level == layout::Level::This;
         let matching = |d: &&LocalDef| {
-            d.number == r.number
-                && d.area == area
-                && match &scope {
-                    Some(s) => d.scope == *s,
-                    // Outside any ROUT the scope is the empty one.
-                    None => d.scope.is_empty(),
-                }
+            let same_scope = match &scope {
+                Some(s) if this_level => d.scope == *s,
+                Some(s) => routine_of(&d.scope) == routine_of(s),
+                // Outside any ROUT the scope is the empty one.
+                None => d.scope.is_empty(),
+            };
+            d.number == r.number && d.area == area && same_scope
         };
         // Definition order is address order within an area, so "the nearest
         // one forwards" is the first at or after here.
@@ -1653,6 +1671,9 @@ impl<'a> Expander<'a> {
         // skipped the second time round.
         self.syms.set_variables(self.initial_vars.clone());
         self.pending_equs.clear();
+        // Counted from nothing again, so an expansion has the same name in
+        // both passes and pass two can find what pass one wrote.
+        self.expansions = 0;
         self.settle_labels();
         // Pass two lays every area out again from the start.
         for sz in &mut self.area_sizes {
@@ -1820,7 +1841,7 @@ impl<'a> Expander<'a> {
             // A SETA/SETL/SETS shows its resulting value in the byte column;
             // that is filled in by `assign` once the value is known.
             let area_index = self.current_area_index();
-            let rout = self.rout.clone();
+            let rout = self.local_scope();
             self.out.push(ExpandedLine {
                 operands: String::new(),
                 text,
@@ -2002,7 +2023,7 @@ impl<'a> Expander<'a> {
             bytes: Vec::new(),
             listing_only: true,
             area_index,
-            rout: self.rout.clone(),
+            rout: self.local_scope(),
             literal: None,
         });
     }
@@ -3016,6 +3037,24 @@ impl<'a> Expander<'a> {
             .map(|n| FixupKind::External(n.clone()))
     }
 
+    /// The scope a local label belongs to.
+    ///
+    /// A `ROUT` starts one, and so does a macro expansion. `DivRem` writes
+    /// an `01` and an `02` of its own, and the `B %FT02` that follows it in
+    /// StringLib means the caller's `02`, not the macro's -- which is four
+    /// instructions into the expansion. Each expansion is told apart from
+    /// every other, so a label written in one is invisible outside it.
+    fn local_scope(&self) -> Option<String> {
+        let rout = self.rout.clone().unwrap_or_default();
+        match self.stack.iter().rev().find_map(|s| match s {
+            Source::Macro { id, .. } => Some(*id),
+            _ => None,
+        }) {
+            Some(id) => Some(format!("{rout} in expansion {id}")),
+            None => self.rout.clone(),
+        }
+    }
+
     /// Record a label's address. Local labels (a bare number) are kept
     /// separately, scoped to the enclosing `ROUT`.
     fn define_label(&mut self, line: &Line) {
@@ -3030,7 +3069,7 @@ impl<'a> Expander<'a> {
         let addr = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
         match layout::parse_local_def(&name) {
             Some((n, routine)) => {
-                let scope = routine.or_else(|| self.rout.clone()).unwrap_or_default();
+                let scope = routine.or_else(|| self.local_scope()).unwrap_or_default();
                 let area = self.current_area_index();
                 self.locals.push(LocalDef { scope, number: n, addr, area });
                 self.fresh_locals.push(self.locals.len() - 1);
@@ -3061,7 +3100,7 @@ impl<'a> Expander<'a> {
         let here = self.area.as_ref().map(|a| a.offset).unwrap_or(0);
         let src = self.expand_text(line.operands_str().unwrap_or(""));
         let area = self.current_area_index();
-        let rout = self.rout.clone();
+        let rout = self.local_scope();
         let src = self.substitute_locals(&src, here, area, rout.as_deref());
         match self.eval_expr(&src) {
             Ok(Value::Logical(true)) => Ok(()),
@@ -3353,7 +3392,7 @@ impl<'a> Expander<'a> {
             }
             let origin = self.origin(line.num);
             let area_index = self.current_area_index();
-            let rout = self.rout.clone();
+            let rout = self.local_scope();
             self.out.push(ExpandedLine {
                 operands,
                 text,
@@ -3403,12 +3442,14 @@ impl<'a> Expander<'a> {
 
         let file = self.origin(call.num).file;
         self.syms.push_frame();
+        self.expansions += 1;
         self.stack.push(Source::Macro {
             name: m.stem.clone(),
             file,
             lines: m.body,
             pos: 0,
             args,
+            id: self.expansions,
             conds: self.conds.len(),
         });
         Ok(())
@@ -4600,5 +4641,81 @@ mod waiting_label_tests {
             "        END",
         ]);
         assert_eq!(got.get("Here").map(|(_, a)| *a), Some(4));
+    }
+}
+
+#[cfg(test)]
+mod local_label_scope_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn words(src: &[&str]) -> Vec<i64> {
+        let r = MapResolver(HashMap::new());
+        let mut e = Expander::new(&r);
+        let out = e
+            .run("test", src.iter().map(|s| s.to_string()).collect())
+            .expect("assembles");
+        out.iter()
+            .filter(|l| !l.listing_only)
+            .filter_map(|l| {
+                let lx = lex::lex_line(0, &l.text);
+                let op = lx.opcode_str()?.to_string();
+                if !op.eq_ignore_ascii_case("B") {
+                    return None;
+                }
+                let ops = e.encoder_operands(l, &op, lx.operands_str().unwrap_or(""));
+                // `.±N` is what the folding leaves for the encoder.
+                let t = ops.trim().to_string();
+                match t.strip_prefix(".+") {
+                    Some(n) => n.parse::<i64>().ok(),
+                    None => t
+                        .strip_prefix(".-")
+                        .and_then(|n| n.parse::<i64>().ok())
+                        .map(|n| -n),
+                }
+            })
+            .collect()
+    }
+
+    /// `DivRem` writes an `01` and an `02` of its own. StringLib's `B %FT02`
+    /// after it means the caller's `02`, four instructions past the end of
+    /// the expansion -- not the macro's, which is inside it.
+    #[test]
+    fn a_macro_keeps_its_local_labels_to_itself() {
+        let got = words(&[
+            "        AREA    x, CODE, READONLY",
+            "        MACRO",
+            "        Twice",
+            "02",
+            "        MOV     r0, #0",
+            "        MOV     r1, #1",
+            "        MEND",
+            "        B       %FT02",
+            "        Twice",
+            "02",
+            "        MOV     r2, #2",
+            "        END",
+        ]);
+        // Past the two instructions the macro laid down, to the `02` the
+        // caller wrote -- not the one four bytes inside it.
+        assert_eq!(got, vec![12]);
+    }
+
+    /// `%BA` looks across every level, which is how spinrw's `MetaLock`
+    /// branches back to a `10` its caller wrote.
+    #[test]
+    fn the_all_levels_form_reaches_the_caller() {
+        let got = words(&[
+            "        AREA    x, CODE, READONLY",
+            "        MACRO",
+            "        Back",
+            "        B       %BA10",
+            "        MEND",
+            "10",
+            "        MOV     r0, #0",
+            "        Back",
+            "        END",
+        ]);
+        assert_eq!(got, vec![-4]);
     }
 }
