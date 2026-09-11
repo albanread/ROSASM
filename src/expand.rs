@@ -2053,6 +2053,7 @@ impl<'a> Expander<'a> {
         match self.eval_expr(&rhs) {
             Ok(Value::Arith(v)) => {
                 self.syms.define_absolute(&name, v);
+                self.inherit_place(&name, &rhs, v);
                 Ok(())
             }
             // A logical or string EQU is legal; keep it in the variable space
@@ -2403,6 +2404,12 @@ impl<'a> Expander<'a> {
                 let _ = self
                     .syms
                     .set("{AREANAME}", Value::Str(name.clone()));
+                // The area's own name is a symbol standing at its base, so
+                // `DCD Init - |Asm$$Code|` is the offset of Init. sdcmos
+                // writes its module header that way.
+                let index = self.current_area_index();
+                self.syms.define_absolute(&name, 0);
+                self.label_defs.insert(name.clone(), (index, 0));
                 self.area = Some(layout::Area { name, attrs, offset });
                 self.settle_labels();
                 self.set_builtin_dot();
@@ -2935,6 +2942,32 @@ impl<'a> Expander<'a> {
                 self.field_bases.insert(name.to_string(), *b);
             }
         }
+    }
+
+    /// A symbol defined from an address in this area is an address in it.
+    ///
+    /// StringLib writes `Instance0 * .` and then `ADRL lr, Instance0`. The
+    /// value came from the location counter, so it names a place in the
+    /// area and moves when the area does -- which is what tells `ADR` to
+    /// reach it from `pc` rather than load a number.
+    ///
+    /// A difference of two such symbols is a distance, not a place, so the
+    /// same question decides it as decides a relocation.
+    fn inherit_place(&mut self, name: &str, rhs: &str, value: u32) {
+        let Some(area) = self.area.as_ref().map(|_| self.current_area_index()) else {
+            return;
+        };
+        let here = rhs.contains('.') || rhs.contains("{PC}");
+        let names_a_label = identifiers(rhs)
+            .iter()
+            .any(|n| self.label_defs.get(n).is_some_and(|(a, _)| *a == area));
+        if !(here || names_a_label) {
+            return;
+        }
+        if names_a_label && !self.moves_with_area(rhs, area) {
+            return;
+        }
+        self.label_defs.insert(name.to_string(), (area, value));
     }
 
     /// The operand text with every assembly-time variable replaced by the
