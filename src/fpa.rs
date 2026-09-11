@@ -930,3 +930,347 @@ mod tests {
         assert!(words("MOV").is_none());
     }
 }
+
+// ---------------------------------------------------------------- encoding
+
+// Encoding, rather than translating.
+//
+// An FPA instruction on this processor is not executed at all. There is no
+// coprocessor 1 or 2, so the word takes the undefined-instruction trap, and
+// FPEmulator -- which this ROM contains -- reads it back out of the
+// instruction stream as data and interprets it:
+//
+// ```text
+//     SUB     Rtmp2,LR,#4           ;Point at bouncing instruction
+//     LDREQT  Rins,[Rtmp2]          ;Get instruction, taking care about
+//     LDRNE   Rins,[Rtmp2]          ; user mode, and advance pointer
+// ```
+//
+// So the word has to be the word the source asked for, bit for bit: the
+// interpreter decodes the same fields ObjAsm encoded. The field positions
+// below are FPEmulator's own, from `HWSupport/FPASC/coresrc/s/fpadefs`.
+
+/// Where each field sits, named as FPEmulator names them.
+mod field {
+    pub const COND: u32 = 28;
+    pub const COPROC: u32 = 8;
+    /// CPDT: the byte offset, in words.
+    pub const DT_OFFSET: u32 = 0;
+    pub const DT_FD: u32 = 12;
+    pub const DT_PR2: u32 = 15;
+    pub const DT_RN: u32 = 16;
+    pub const DT_LOAD: u32 = 20;
+    pub const DT_WRITEBACK: u32 = 21;
+    pub const DT_PR1: u32 = 22;
+    pub const DT_UP: u32 = 23;
+    pub const DT_PREINDEX: u32 = 24;
+    /// CPDO and CPRT share these.
+    pub const S2: u32 = 0;
+    pub const OP3: u32 = 4;
+    pub const RM: u32 = 5;
+    pub const PR2: u32 = 7;
+    pub const DS: u32 = 12;
+    pub const OP2: u32 = 15;
+    pub const S1: u32 = 16;
+    pub const PR1: u32 = 19;
+    pub const OP1: u32 = 20;
+}
+
+/// The condition's four bits.
+fn cond_bits(cond: &str) -> u32 {
+    const ORDER: [&str; 16] = [
+        "EQ", "NE", "CS", "CC", "MI", "PL", "VS", "VC", "HI", "LS", "GE", "LT", "GT", "LE", "AL",
+        "NV",
+    ];
+    if cond.is_empty() {
+        return 0xE;
+    }
+    ORDER.iter().position(|c| *c == cond).unwrap_or(0xE) as u32
+}
+
+impl Precision {
+    /// The two precision bits, which live apart in every format.
+    fn bits(self) -> (u32, u32) {
+        match self {
+            Precision::Single => (0, 0),
+            Precision::Double => (0, 1),
+            Precision::Extended => (1, 0),
+            Precision::Packed => (1, 1),
+        }
+    }
+
+    /// Which coprocessor claims it: 1 for the sizes an FPA holds in registers,
+    /// 2 for the two memory formats.
+    fn coproc(self) -> u32 {
+        match self {
+            Precision::Single | Precision::Double => 1,
+            Precision::Extended | Precision::Packed => 2,
+        }
+    }
+}
+
+/// `f0`..`f7`, by name.
+fn fpa_register(name: &str) -> Option<u32> {
+    let n = name.trim().to_ascii_lowercase();
+    n.strip_prefix('f')?.parse::<u32>().ok().filter(|v| *v < 8)
+}
+
+/// An ARM register, by the spellings that reach here.
+fn arm_register(name: &str) -> Option<u32> {
+    let n = name.trim().to_ascii_lowercase();
+    match n.as_str() {
+        "pc" => Some(15),
+        "lr" => Some(14),
+        "sp" => Some(13),
+        _ => n.strip_prefix('r')?.parse::<u32>().ok().filter(|v| *v < 16),
+    }
+}
+
+/// The rounding mode's two bits: nearest, plus infinity, minus infinity, zero.
+fn rounding_bits(r: Option<char>) -> u32 {
+    match r {
+        Some('P') => 1,
+        Some('M') => 2,
+        Some('Z') => 3,
+        _ => 0,
+    }
+}
+
+/// The four bits that say which data operation this is.
+///
+/// Dyadic operations take two registers and leave `Op2` clear; monadic ones
+/// take one and set it.
+fn data_opcode(stem: &str) -> Option<(u32, bool)> {
+    let dyadic = [
+        "ADF", "MUF", "SUF", "RSF", "DVF", "RDF", "POW", "RPW", "RMF", "FML", "FDV", "FRD", "POL",
+    ];
+    if let Some(i) = dyadic.iter().position(|s| *s == stem) {
+        return Some((i as u32, false));
+    }
+    let monadic = [
+        "MVF", "MNF", "ABS", "RND", "SQT", "LOG", "LGN", "EXP", "SIN", "COS", "TAN", "ASN", "ACS",
+        "ATN", "URD", "NRM",
+    ];
+    monadic.iter().position(|s| *s == stem).map(|i| (i as u32, true))
+}
+
+/// The four bits that say which register transfer this is, `L` included.
+fn transfer_opcode(stem: &str, exception: bool) -> Option<u32> {
+    Some(match stem {
+        "FLT" => 0b0000,
+        "FIX" => 0b0001,
+        "WFS" => 0b0010,
+        "RFS" => 0b0011,
+        "WFC" => 0b0100,
+        "RFC" => 0b0101,
+        "CMF" if exception => 0b1101,
+        "CMF" => 0b1001,
+        "CNF" if exception => 0b1111,
+        "CNF" => 0b1011,
+        _ => return None,
+    })
+}
+
+/// An FPA instruction as the word FPEmulator will read.
+///
+/// `None` means this is not an FPA mnemonic at all. Anything else is one, and
+/// a refusal is a gap here rather than a limit of the target: the FPA has no
+/// instruction its own encoding cannot hold.
+pub fn encode(mnemonic: &str, operands: &str) -> Option<Legalized> {
+    let f = parse(mnemonic)?;
+    let cond = cond_bits(&f.cond) << field::COND;
+    let parts = split_operands(operands);
+    let word = match f.stem {
+        "LDF" | "STF" | "LFM" | "SFM" => data_transfer(&f, cond, &parts),
+        "FLT" | "FIX" | "WFS" | "RFS" | "WFC" | "RFC" | "CMF" | "CNF" => {
+            register_transfer(&f, cond, &parts)
+        }
+        _ => data_operation(&f, cond, &parts),
+    };
+    Some(match word {
+        Some(w) => Legalized::RawWord(w),
+        None => refuse(mnemonic, "its operands are not ones I know how to encode"),
+    })
+}
+
+/// Operands split on commas, with a bracketed addressing mode kept whole.
+fn split_operands(operands: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in operands.chars() {
+        match c {
+            '[' | '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ']' | '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out.into_iter().map(|s| s.trim().to_string()).collect()
+}
+
+/// `LDF`, `STF`, `LFM` and `SFM`: a coprocessor data transfer.
+fn data_transfer(f: &Fpa, cond: u32, parts: &[String]) -> Option<u32> {
+    let load = matches!(f.stem, "LDF" | "LFM");
+    let multiple = matches!(f.stem, "LFM" | "SFM");
+    let fd = fpa_register(parts.first()?)?;
+
+    // `LFM f0, 4, [r0, #n]` says how many registers before the address.
+    let (count, addr) = if multiple {
+        (parts.get(1)?.trim().parse::<u32>().ok()?, parts.get(2)?)
+    } else {
+        (0, parts.get(1)?)
+    };
+
+    // The two precision bits carry the format for a single transfer and the
+    // number of registers for a multiple one, where four is written as zero.
+    let (pr1, pr2) = if multiple {
+        match count {
+            1 => (0, 1),
+            2 => (1, 0),
+            3 => (1, 1),
+            4 => (0, 0),
+            _ => return None,
+        }
+    } else {
+        f.precision?.bits()
+    };
+    let coproc = if multiple { 2 } else { f.precision?.coproc() };
+
+    let (rn, offset, pre, up, writeback) = addressing(addr)?;
+    Some(
+        cond | (0b110 << 25)
+            | (pre << field::DT_PREINDEX)
+            | (up << field::DT_UP)
+            | (pr1 << field::DT_PR1)
+            | (writeback << field::DT_WRITEBACK)
+            | (u32::from(load) << field::DT_LOAD)
+            | (rn << field::DT_RN)
+            | (pr2 << field::DT_PR2)
+            | (fd << field::DT_FD)
+            | (coproc << field::COPROC)
+            | (offset << field::DT_OFFSET),
+    )
+}
+
+/// `[Rn, #off]`, `[Rn, #off]!`, `[Rn], #off` and `[Rn]`.
+///
+/// Gives back the base register, the offset in words, and the P, U and W bits.
+fn addressing(text: &str) -> Option<(u32, u32, u32, u32, u32)> {
+    let t = text.trim();
+    let close = t.find(']')?;
+    let inside = t.get(1..close)?;
+    let after = t.get(close + 1..)?.trim();
+
+    let mut inner = inside.splitn(2, ',');
+    let rn = arm_register(inner.next()?)?;
+    let written = inner.next().map(str::trim).unwrap_or("");
+
+    // Post-indexed writes the offset after the bracket, and always writes back.
+    let (pre, writeback, offset_text) = if let Some(rest) = after.strip_prefix(',') {
+        (0, 1, rest.trim())
+    } else {
+        (1, u32::from(after == "!"), written)
+    };
+
+    let bytes = if offset_text.is_empty() { 0 } else { parse_offset(offset_text)? };
+    if bytes % 4 != 0 {
+        return None;
+    }
+    let words = bytes / 4;
+    let magnitude = words.unsigned_abs() as u32;
+    if magnitude > 0xFF {
+        return None;
+    }
+    Some((rn, magnitude, pre, u32::from(words >= 0), writeback))
+}
+
+/// `ADF`, `MVF` and the rest: a coprocessor data operation.
+fn data_operation(f: &Fpa, cond: u32, parts: &[String]) -> Option<u32> {
+    let (opcode, monadic) = data_opcode(f.stem)?;
+    let (pr1, pr2) = f.precision?.bits();
+    let fd = fpa_register(parts.first()?)?;
+    let (fn_, last) = if monadic {
+        (0, parts.get(1)?)
+    } else {
+        (fpa_register(parts.get(1)?)?, parts.get(2)?)
+    };
+    let s2 = operand_or_constant(last)?;
+    Some(
+        cond | (0b1110 << 24)
+            | (opcode << field::OP1)
+            | (pr1 << field::PR1)
+            | (fn_ << field::S1)
+            | (u32::from(monadic) << field::OP2)
+            | (fd << field::DS)
+            | (1 << field::COPROC)
+            | (pr2 << field::PR2)
+            | (rounding_bits(f.rounding) << field::RM)
+            | (s2 << field::S2),
+    )
+}
+
+/// `FLT`, `FIX`, `CMF` and the status transfers: a coprocessor register
+/// transfer, where the ARM register sits in the four bits `Ds` and `Op2`
+/// share.
+fn register_transfer(f: &Fpa, cond: u32, parts: &[String]) -> Option<u32> {
+    let opcode = transfer_opcode(f.stem, f.exception)?;
+    let (pr1, pr2) = f.precision.map_or((0, 0), Precision::bits);
+    let (rd, fn_, s2) = match f.stem {
+        // `FLT Fn, Rd` puts an integer into the FPA.
+        "FLT" => (arm_register(parts.get(1)?)?, fpa_register(parts.first()?)?, 0),
+        // `FIX Rd, Fm` takes one out.
+        "FIX" => (arm_register(parts.first()?)?, 0, fpa_register(parts.get(1)?)?),
+        // A comparison puts its answer in the flags, which is written as `pc`
+        // where the ARM register goes.
+        "CMF" | "CNF" => (
+            15,
+            fpa_register(parts.first()?)?,
+            operand_or_constant(parts.get(1)?)?,
+        ),
+        // The status words take an ARM register and nothing else.
+        _ => (arm_register(parts.first()?)?, 0, 0),
+    };
+    Some(
+        cond | (0b1110 << 24)
+            | (opcode << field::OP1)
+            | (pr1 << field::PR1)
+            | (fn_ << field::S1)
+            | (rd << field::DS)
+            | (1 << field::COPROC)
+            | (pr2 << field::PR2)
+            | (rounding_bits(f.rounding) << field::RM)
+            | (1 << field::OP3)
+            | (s2 << field::S2),
+    )
+}
+
+/// A register, or one of the eight constants an FPA holds -- which are
+/// written in the same field, with the bit above the register numbers set.
+fn operand_or_constant(text: &str) -> Option<u32> {
+    if let Some(r) = fpa_register(text) {
+        return Some(r);
+    }
+    let t = text.trim().trim_start_matches('#').trim();
+    let n = match t {
+        "0" | "0.0" => 0,
+        "1" | "1.0" => 1,
+        "2" | "2.0" => 2,
+        "3" | "3.0" => 3,
+        "4" | "4.0" => 4,
+        "5" | "5.0" => 5,
+        "0.5" => 6,
+        "10" | "10.0" => 7,
+        _ => return None,
+    };
+    Some(0b1000 | n)
+}

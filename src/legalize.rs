@@ -373,11 +373,13 @@ pub fn legalize(mnemonic: &str, operands: &str, ctx: &Context) -> Legalized {
         }
     }
 
-    // The FPA instruction set, which this target does not have. What VFP can
-    // express is translated; what it cannot is refused by name, with the
-    // reason, rather than turned into something that would quietly compute a
-    // different answer.
-    if let Some(l) = crate::fpa::convert(&up, operands) {
+    // The FPA instruction set, which nothing here executes. There is no
+    // coprocessor 1 or 2 on this processor, so the word takes the undefined
+    // instruction trap and FPEmulator -- which the ROM contains -- reads it
+    // back out of the instruction stream as data and interprets it. So the
+    // word is emitted as the source asked for it, bit for bit, rather than
+    // translated into something else that would never be read.
+    if let Some(l) = crate::fpa::encode(&up, operands) {
         return l;
     }
 
@@ -698,17 +700,22 @@ mod tests {
     }
 
     #[test]
-    fn an_fpa_instruction_is_translated_here() {
+    fn an_fpa_instruction_is_encoded_here() {
+        // Nothing executes these. The word takes the undefined instruction
+        // trap and FPEmulator reads it back as data, so what goes in the
+        // object is what the source asked for -- checked against ObjAsm's
+        // own objects.
         let ctx = Context { here: 0, target: None, relocated: false };
+        assert_eq!(legalize("RFS", "r1", &ctx), Legalized::RawWord(0xEE30_1110));
+        assert_eq!(legalize("WFS", "r1", &ctx), Legalized::RawWord(0xEE20_1110));
         assert_eq!(
-            legalize("ADFD", "f0, f1, f2", &ctx),
-            Legalized::One("VADD.F64".into(), "d0, d1, d2".into())
+            legalize("SFM", "f0, 4, [r0, #4]", &ctx),
+            Legalized::RawWord(0xED80_0201)
         );
-        // And one VFP has no answer for is refused, not mistranslated.
-        assert!(matches!(
-            legalize("LDFE", "f0, [sp], #12", &ctx),
-            Legalized::Unsupported(_)
-        ));
+        assert_eq!(
+            legalize("LFM", "f0, 4, [r0, #4]", &ctx),
+            Legalized::RawWord(0xED90_0201)
+        );
     }
 
     #[test]
