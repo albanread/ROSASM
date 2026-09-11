@@ -1559,11 +1559,21 @@ impl<'a> Expander<'a> {
                     // `wanted`. It is always the last operand, and the
                     // rotation is even and under 32, which is what tells it
                     // apart from an operand that merely follows.
+                    //
+                    // A register is not a rotation, however its number
+                    // reads. `SSAT r2, #16, r2` saturates into r2 and the
+                    // third operand is the register it works on: taking it
+                    // for a rotation turns it into `#0x10, 2`, which the
+                    // encoder refuses -- and an odd-numbered register would
+                    // have gone through untouched, which is worse.
                     let mut rotation = None;
                     if lead == '#' && i < cs.len() && cs[i] == ',' {
                         let rest: String = cs[i + 1..].iter().collect();
-                        if !rest.contains(',') {
-                            if let Some(r) = self.eval_immediate(rest.trim()) {
+                        let rest = rest.trim().to_string();
+                        let a_register = self.reg_aliases.contains_key(rest.as_str())
+                            || Self::numbered_register(&rest).is_some();
+                        if !rest.contains(',') && !a_register {
+                            if let Some(r) = self.eval_immediate(&rest) {
                                 if r < 32 && r % 2 == 0 {
                                     rotation = Some(r);
                                     i = cs.len();
@@ -2239,6 +2249,16 @@ impl<'a> Expander<'a> {
         self.map_base = parts.get(1).and_then(|r| self.register_number(r.trim()));
         self.set_builtin_at();
         Ok(())
+    }
+
+    /// `r0`..`r15` and the names the encoder uses, by their numbered
+    /// spelling alone -- no aliases, which the caller checks separately.
+    fn numbered_register(word: &str) -> Option<u32> {
+        let w = word.trim().to_ascii_lowercase();
+        match w.as_str() {
+            "pc" | "lr" | "sp" | "ip" | "fp" | "sl" => Some(0),
+            _ => w.strip_prefix('r')?.parse::<u32>().ok().filter(|n| *n < 16),
+        }
     }
 
     /// The register a name stands for, whether written `r12`, `R12` or under

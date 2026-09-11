@@ -228,6 +228,59 @@ struct AdrReloc {
     instructions: u8,
 }
 
+/// Say what the encoder said, against the source rather than the lowering.
+///
+/// clang names a line in a temporary file, which is no use to anyone reading
+/// it: the daily question is which line of which `.s` it came from. Every
+/// instruction in the lowered text carries a `__ros<i>` label naming the
+/// expanded line it came from, so walking back from the diagnostic to the
+/// nearest label answers it.
+fn report_encoder(stderr: &str, ual: &str, lines: &[ExpandedLine]) {
+    let lowered: Vec<&str> = ual.lines().collect();
+    for line in stderr.lines() {
+        // `<path>:<line>:<col>: <severity>: <message>`. The path has a colon
+        // of its own on this host, so the line is read from the right.
+        let Some((head, severity, message)) = ["error", "warning", "note"]
+            .iter()
+            .find_map(|s| {
+                let mark = format!(": {s}: ");
+                line.find(&mark)
+                    .map(|i| (&line[..i], *s, line[i + mark.len()..].trim()))
+            })
+        else {
+            continue;
+        };
+        let mut fields = head.rsplit(':');
+        let (Some(_col), Some(at)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(at) = at.trim().parse::<usize>() else { continue };
+        match origin_of(&lowered, at, lines) {
+            Some((where_, text)) => {
+                eprintln!("rosasm: {where_}: {severity}: {message}");
+                eprintln!("        {text}");
+            }
+            None => eprintln!("rosasm: {severity}: {message}"),
+        }
+    }
+}
+
+/// The source line an instruction in the lowered text came from.
+fn origin_of<'a>(
+    lowered: &[&str],
+    at: usize,
+    lines: &'a [ExpandedLine],
+) -> Option<(String, &'a str)> {
+    let mut i = at.min(lowered.len()).checked_sub(1)?;
+    loop {
+        if let Some(n) = lowered[i].strip_prefix("__ros").and_then(|t| t.strip_suffix(':')) {
+            let l = lines.get(n.parse::<usize>().ok()?)?;
+            return Some((format!("{}:{}", l.origin.file, l.origin.line), l.text.trim()));
+        }
+        i = i.checked_sub(1)?;
+    }
+}
+
 /// The space an instruction was given, filled with nothing.
 ///
 /// As many words as the location counter reserved: two for `ADRL`, two for
@@ -550,16 +603,21 @@ fn main() {
         eprintln!("rosasm: {e}");
         std::process::exit(1);
     }
-    let status = Command::new(CLANG)
+    let run = Command::new(CLANG)
         .args(TARGET)
         .arg("-c")
         .arg(&asm_path)
         .arg("-o")
         .arg(&obj_path)
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(_) => {
+        .output();
+    match run {
+        Ok(out) if out.status.success() => {
+            // Warnings still say something worth hearing, and they name the
+            // lowered file too.
+            report_encoder(&String::from_utf8_lossy(&out.stderr), &ual, &lines);
+        }
+        Ok(out) => {
+            report_encoder(&String::from_utf8_lossy(&out.stderr), &ual, &lines);
             eprintln!("rosasm: the encoder rejected the lowered assembly");
             eprintln!("        kept at {}", asm_path.display());
             std::process::exit(1);

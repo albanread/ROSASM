@@ -129,6 +129,15 @@ pub fn is_psr_form(m: &str) -> bool {
 pub fn normalise_mnemonic(m: &str) -> Option<String> {
     let up = m.to_ascii_uppercase();
 
+    // `UND` is the pre-UAL spelling of the permanently undefined
+    // instruction; UAL calls it `UDF`. BCMVideo plants them where a case
+    // cannot arise.
+    if let Some(rest) = up.strip_prefix("UND") {
+        if rest.is_empty() || is_condition(rest) {
+            return Some(format!("UDF{}", canonical_condition(rest)));
+        }
+    }
+
     // `SWI` is the pre-UAL spelling of `SVC`; it may carry a condition.
     if let Some(rest) = up.strip_prefix("SWI") {
         if rest.is_empty() || CONDS.contains(&rest) || COND_ALIASES.iter().any(|(a, _)| *a == rest) {
