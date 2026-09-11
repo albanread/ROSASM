@@ -69,6 +69,8 @@ def assemble(unit):
     """Run the whole pipeline on one unit. Returns a result dict."""
     comp = os.path.dirname(os.path.dirname(unit))
     args = [ROSASM, unit, "-I", comp, "-I", os.path.join(comp, "hdr")]
+    if ALLOW[0]:
+        args.append("--allow-unencodable")
     for d in HDRROOT[0]:
         args += ["-I", d]
     for pd in PD:
@@ -120,6 +122,10 @@ def assemble(unit):
     }
 
 
+# Whether an object with instructions missing from it counts as one.
+# It does not, by default: that is what the sweep is measuring.
+ALLOW = [False]
+
 HDRROOT = [None]
 ROOT = [None]
 OPTIONS = [{}]
@@ -135,11 +141,17 @@ def main():
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--out")
     ap.add_argument(
+        "--allow-unencodable",
+        action="store_true",
+        help="count a unit as assembled with instructions missing from it",
+    )
+    ap.add_argument(
         "--only",
         help="assemble only units whose path contains this, and print what "
         "each one said in full",
     )
     a = ap.parse_args()
+    ALLOW[0] = a.allow_unencodable
 
     # The emulator's disc is not involved here, so the export tree goes
     # somewhere local rather than into hostfs. This is the build's export_hdrs

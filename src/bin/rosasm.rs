@@ -127,7 +127,12 @@ impl FileResolver for Dirs {
 /// Data directives are not re-emitted: their bytes were computed during
 /// expansion, where `@`, `?label` and the ObjAsm operators are meaningful.
 /// Only instructions go to LLVM.
-fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>, Vec<AdrReloc>) {
+fn to_ual(
+    lines: &[ExpandedLine],
+    ex: &Expander,
+    refused: &mut Vec<Unencodable>,
+    allow: bool,
+) -> (String, Vec<usize>, Vec<AdrReloc>) {
     // The directives have to agree with the command line, and they win where
     // they disagree: `.fpu neon` is VFPv3 and would refuse the A72's fused
     // multiply-adds however the driver was invoked.
@@ -176,8 +181,8 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>, Vec<Adr
                     continue;
                 }
                 Err(why) => {
-                    eprintln!("rosasm: {}:{}: {why}", l.origin.file, l.origin.line);
-                    s.push_str(&zero_words(op));
+                    s.push_str(&placeholder(op, refused.len(), allow));
+                    refused.push(Unencodable::of(l, why));
                     index.push(i);
                     continue;
                 }
@@ -209,14 +214,39 @@ fn to_ual(lines: &[ExpandedLine], ex: &Expander) -> (String, Vec<usize>, Vec<Adr
             }
             Legalized::RawWord(w) => s.push_str(&format!("        .inst 0x{w:08X}\n")),
             Legalized::Unsupported(why) => {
-                eprintln!("rosasm: {}:{}: {why}", l.origin.file, l.origin.line);
-                // Keep the space occupied so later addresses do not shift.
-                s.push_str(&zero_words(op));
+                // The space stays occupied either way, so later addresses do
+                // not shift and the rest of the object stays readable.
+                s.push_str(&placeholder(op, refused.len(), allow));
+                refused.push(Unencodable::of(l, why));
             }
         }
         index.push(i);
     }
     (s, index, adr_relocs)
+}
+
+/// Something this assembler could not encode.
+///
+/// A zero word is `ANDEQ r0, r0, r0`: it executes, does nothing, and says
+/// nothing, so an object holding one quietly does the wrong thing where an
+/// instruction should have been. Every one is collected and the run fails
+/// unless the caller has asked for otherwise.
+struct Unencodable {
+    /// Where the source said it, as `file:line`.
+    where_: String,
+    /// The line as written.
+    what: String,
+    why: String,
+}
+
+impl Unencodable {
+    fn of(l: &ExpandedLine, why: String) -> Self {
+        Self {
+            where_: format!("{}:{}", l.origin.file, l.origin.line),
+            what: l.text.trim().to_string(),
+            why,
+        }
+    }
 }
 
 /// An `ADR` whose target only the linker knows.
@@ -281,13 +311,21 @@ fn origin_of<'a>(
     }
 }
 
-/// The space an instruction was given, filled with nothing.
+/// The space an instruction was given, filled with something that says so.
 ///
 /// As many words as the location counter reserved: two for `ADRL`, two for
 /// an FPA compare, one for everything else. Emitting a single word instead
 /// moves every label after it.
-fn zero_words(mnemonic: &str) -> String {
-    "        .inst 0x00000000\n".repeat(rosasm::lower::instruction_words(mnemonic))
+///
+/// `UDF #n` traps where a zero word would have run on, and `n` says which
+/// of the listed instructions it stands for.
+fn placeholder(mnemonic: &str, n: usize, allow: bool) -> String {
+    let words = rosasm::lower::instruction_words(mnemonic);
+    if allow {
+        format!("        UDF #{n}\n").repeat(words)
+    } else {
+        "        .inst 0x00000000\n".repeat(words)
+    }
 }
 
 /// An `LDR Rd,=value` rendered as a load from the literal pool.
@@ -485,6 +523,7 @@ fn main() {
     let mut keep = false;
     let mut map: Option<PathBuf> = None;
     let mut warn_assertions = false;
+    let mut allow_unencodable = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -508,6 +547,10 @@ fn main() {
             // The sources assert their own layout, so a failure is a defect
             // and stops the build. Investigating one needs the opposite.
             "--warn-assertions" => warn_assertions = true,
+            // An object with instructions missing from it is not an object
+            // a ROM can be built with, so saying so is the default. This
+            // asks for one anyway, with every gap trapping at run time.
+            "--allow-unencodable" => allow_unencodable = true,
             "--map" => {
                 i += 1;
                 map = args.get(i).map(PathBuf::from);
@@ -519,7 +562,7 @@ fn main() {
     let (Some(source), Some(out)) = (source, out) else {
         eprintln!(
             "usage: rosasm <source> -o <object> [-I dir]... [-PD assignment]... \
-             [--map file] [--warn-assertions] [--keep-temps]"
+             [--map file] [--warn-assertions] [--allow-unencodable] [--keep-temps]"
         );
         std::process::exit(2);
     };
@@ -595,7 +638,10 @@ fn main() {
     }
 
     // Encode the instructions.
-    let (ual, index, adr_relocs) = to_ual(&lines, &ex);
+    // Everything the object cannot honestly contain, collected rather
+    // than printed and forgotten.
+    let mut refused: Vec<Unencodable> = Vec::new();
+    let (ual, index, adr_relocs) = to_ual(&lines, &ex, &mut refused, allow_unencodable);
     let tmp = std::env::temp_dir().join(format!("rosasm-{}", std::process::id()));
     let asm_path = tmp.with_extension("s");
     let obj_path = tmp.with_extension("o");
@@ -839,10 +885,14 @@ fn main() {
         } else if reloc::is_ldr_literal(r.kind) {
             (reloc::ldr_addend(insn), reloc::set_ldr_addend)
         } else {
-            eprintln!(
-                "rosasm: {name}: unhandled relocation type {} at &{here:X}",
-                r.kind
-            );
+            refused.push(Unencodable {
+                where_: lines.get(seg.line).map_or_else(
+                    || format!("&{here:X}"),
+                    |l| format!("{}:{}", l.origin.file, l.origin.line),
+                ),
+                what: lines.get(seg.line).map(|l| l.text.trim().to_string()).unwrap_or_default(),
+                why: format!("relocation type {} against {name} is not handled", r.kind),
+            });
             continue;
         };
         // Three cases: a target in this same area needs no directive at all,
@@ -865,7 +915,14 @@ fn main() {
         match encode(insn, new_addend) {
             Some(w) => set_word_at(&mut areas[seg.area].data, here, w),
             None => {
-                eprintln!("rosasm: {name} at &{here:X} is out of reach from here");
+                refused.push(Unencodable {
+                    where_: lines.get(seg.line).map_or_else(
+                        || format!("&{here:X}"),
+                        |l| format!("{}:{}", l.origin.file, l.origin.line),
+                    ),
+                    what: lines.get(seg.line).map(|l| l.text.trim().to_string()).unwrap_or_default(),
+                    why: format!("{name} is out of reach from here"),
+                });
                 continue;
             }
         }
@@ -925,6 +982,31 @@ fn main() {
             based: false,
             max_instructions: 0,
         });
+    }
+
+    // An object with instructions missing from it is not one a ROM can be
+    // built with. Saying so, and writing nothing, is the default; the
+    // alternative is asked for by name and traps at run time instead.
+    if !refused.is_empty() {
+        for (n, r) in refused.iter().enumerate() {
+            let index = if allow_unencodable {
+                format!(" [UDF #{n}]")
+            } else {
+                String::new()
+            };
+            eprintln!("rosasm: {}: {}{index}", r.where_, r.why);
+            eprintln!("        {}", r.what);
+        }
+        let n = refused.len();
+        let s = if n == 1 { "" } else { "s" };
+        if allow_unencodable {
+            eprintln!("rosasm: {n} instruction{s} will trap if reached");
+        } else {
+            eprintln!("rosasm: {n} instruction{s} could not be encoded");
+            eprintln!("        no object written");
+            eprintln!("        --allow-unencodable writes one anyway, trapping at each");
+            std::process::exit(1);
+        }
     }
 
     let obj = aof::Object {
