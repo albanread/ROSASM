@@ -2627,7 +2627,12 @@ impl<'a> Expander<'a> {
             }
             // A string in a DCB contributes its characters, `""` being one.
             if width == 1 && t.starts_with('"') {
-                let inner = t.trim_start_matches('"').trim_end_matches('"');
+                // One quote off each end: `DCB """", 0` is an escaped
+                // quote, and taking every quote leaves an empty string.
+                let inner = t
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(t);
                 let mut it = inner.chars().peekable();
                 while let Some(c) = it.next() {
                     if c == '"' && it.peek() == Some(&'"') {
@@ -4481,6 +4486,20 @@ mod automatic_alignment_tests {
         assert_eq!(got.len(), 16);
         assert_eq!(&got[4..12], &[0u8; 8]);
         assert_eq!(&got[12..], &[0x22, 0x22, 0x22, 0x22]);
+    }
+
+    /// NetFiler writes `quote DCB """", 0` -- a string holding one quote,
+    /// written as two, and a terminator. Taking every quote off each end
+    /// leaves nothing, so the line was one byte where it is two, and every
+    /// address after it in the file was four bytes early.
+    #[test]
+    fn an_escaped_quote_is_a_character() {
+        let got = bytes(&[
+            "        AREA    x, DATA",
+            "        DCB     \"\"\"\", 0",
+            "        END",
+        ]);
+        assert_eq!(got, vec![b'"', 0]);
     }
 
     #[test]

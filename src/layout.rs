@@ -226,7 +226,13 @@ pub fn data_size(directive: &str, operands: &str) -> Option<u32> {
         if unit == 1 && item.starts_with('"') {
             // A string contributes one byte per character, with `""` an
             // escaped quote rather than two characters.
-            let inner = item.trim_start_matches('"').trim_end_matches('"');
+            // One quote off each end, not every quote: `DCB """", 0`
+            // holds an escaped quote, and stripping them all leaves nothing
+            // where there is a character.
+            let inner = item
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(item);
             let mut n = 0u32;
             let mut it = inner.chars().peekable();
             while let Some(c) = it.next() {
