@@ -92,12 +92,15 @@ fn describe_symbol(attr: u32) -> String {
         (sym_attr::WEAK, "weak"),
         (sym_attr::STRONG, "strong"),
         (sym_attr::COMMON, "common"),
+        (sym_attr::CODE_DATUM, "code-datum"),
     ] {
         if attr & bit != 0 {
             v.push(name);
         }
     }
-    v.join(", ")
+    // The raw word as well: the named bits are the ones we understand, and
+    // reading ObjAsm's objects is how the rest get understood.
+    format!("{} [{attr:02X}]", v.join(", "))
 }
 
 // ------------------------------------------------------------- comparison
