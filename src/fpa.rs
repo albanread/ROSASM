@@ -999,14 +999,7 @@ impl Precision {
         }
     }
 
-    /// Which coprocessor claims it: 1 for the sizes an FPA holds in registers,
-    /// 2 for the two memory formats.
-    fn coproc(self) -> u32 {
-        match self {
-            Precision::Single | Precision::Double => 1,
-            Precision::Extended | Precision::Packed => 2,
-        }
-    }
+
 }
 
 /// `f0`..`f7`, by name.
@@ -1144,7 +1137,15 @@ fn data_transfer(f: &Fpa, cond: u32, parts: &[String]) -> Option<u32> {
     } else {
         f.precision?.bits()
     };
-    let coproc = if multiple { 2 } else { f.precision?.coproc() };
+    // The coprocessor number says which kind of transfer it is, not which
+    // format: a single one is coprocessor 1 whatever its precision, and a
+    // multiple one is coprocessor 2. The format is the two precision bits
+    // alone -- `LDFE f0,[r0]` is &EDD00100 in ObjAsm's object, coprocessor 1
+    // with `pr1` set.
+    let coproc = if multiple { 2 } else { 1 };
+    if !multiple {
+        f.precision?;
+    }
 
     let (rn, offset, pre, up, writeback) = addressing(addr)?;
     Some(
