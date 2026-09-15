@@ -17,14 +17,24 @@ in the order that makes the corpus numbers trustworthy first.
 | units in the BCM2835 build | 241 | 245 |
 | assembling to an object | 212 (88.0%) | 215 (87.8%) |
 | code bytes emitted | 240,596 in 254 areas | 224,284 in 262 areas |
-| instructions emitted as zero words | 220 | **110** |
+| instructions emitted as zero words | 220 | **47** |
 | failures | 29 | 30, of which 15 outside the build |
 | byte-identical to ObjAsm | 4, in an oracle run that compared 18 units before its ObjAsm side died | not re-run |
 
-The zero words halved because §0 and §1 landed: what used to be emitted
-silently is now counted and refused. All 110 remaining are FPA -- extended
-precision and transcendentals -- which is why the tally is dominated by `CMF`
-and the `LDF` family.
+The zero words fell because §0 and §1 landed -- what used to be emitted
+silently is now counted and refused -- and then because the FPA constants
+were being matched against the source's spelling rather than the evaluator's
+(`1b81593`), which alone took 110 to 47.
+
+All 47 that remain are `LDF` whose address is a label or a float literal
+rather than `[Rn, #off]`. Nothing about them is a limit of the target: the
+FPA has no instruction its own encoding cannot hold, and rosasm emits these
+as raw words rather than asking LLVM, which does not know the coprocessor at
+all. It is one missing addressing mode, in two forms -- a bare label
+(`LDFE F1,SqrtHalf` in `mathasm`), which is a PC-relative offset within the
+FPA's own +/-1020 byte reach, and a float literal (`LDFNES f0,=-0.0` in
+`cl_body`, `LDFS f1,=5729.57795` in `MakePSFont`), which additionally needs
+the value's bits placed in a pool.
 
 The 2026-09-15 column was measured on the Mac, where there is no `BuildHost`
 checkout, so `tokenise` cannot be built. Seven of the thirty failures are that
@@ -138,8 +148,8 @@ and boot" as the second-order check. Do it for one small module first.
 | Check | Result |
 |---|---|
 | `cargo build --release` | clean, zero warnings |
-| `cargo test` | 292 unit tests and 27 integration tests pass (325 in all on 2026-09-15) |
-| `tools/codegen_sweep.py` on the head build | 241 units, 212 objects, 220 zero words, 29 failures (2026-09-15: 245, 215, 110, 30) |
+| `cargo test` | 292 unit tests and 27 integration tests pass (329 in all on 2026-09-15) |
+| `tools/codegen_sweep.py` on the head build | 241 units, 212 objects, 220 zero words, 29 failures (2026-09-15: 245, 215, 47, 30) |
 | `--cpu`, target, encoder | clang 22 as `--target=arm-none-eabi -mcpu=cortex-a72 -mfpu=neon-fp-armv8` |
 | the nine ADRL zero words from the committed report | gone since `cbec42f` |
 
