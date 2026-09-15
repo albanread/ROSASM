@@ -929,6 +929,61 @@ mod tests {
         assert!(convert("MOV", "r0, #1").is_none());
         assert!(words("MOV").is_none());
     }
+
+    // ---- encoding the constants -----------------------------------------
+
+    fn word(m: &str, o: &str) -> u32 {
+        match encode(m, o) {
+            Some(Legalized::RawWord(w)) => w,
+            other => panic!("{m} {o}: expected a word, got {other:?}"),
+        }
+    }
+
+    fn encoding_refused(m: &str, o: &str) -> bool {
+        matches!(encode(m, o), Some(Legalized::Unsupported(_)))
+    }
+
+    #[test]
+    fn an_immediate_encodes_the_same_however_the_source_spelled_it() {
+        // `#0` is an integer expression, so it reaches the encoder folded to
+        // eight hex digits; `#0.0` is not an integer, so it arrives as
+        // written. They are the same instruction and must be the same word.
+        for (folded, written) in [
+            ("f0,#00000000", "f0,#0.0"),
+            ("f0,#0x0", "f0,#0.0"),
+            ("f0,#00000005", "f0,#5.0"),
+            ("f0,#0000000A", "f0,#10.0"),
+        ] {
+            assert_eq!(word("MVFD", folded), word("MVFD", written), "{folded}");
+        }
+    }
+
+    #[test]
+    fn comparing_against_zero_is_the_constant_not_register_one() {
+        // The constants share their field with the register numbers, and are
+        // told apart by the bit above them. Losing that bit turns `CMF f0,#0`
+        // into `CMF f0,f1` -- an instruction that assembles and is wrong.
+        assert_eq!(word("CMF", "f0,#00000000"), 0xEE90F118);
+        assert_eq!(word("CMF", "f0,f1"), 0xEE90F111);
+    }
+
+    #[test]
+    fn a_value_that_is_not_one_of_the_eight_is_refused() {
+        // Six and seven are not FPA constants, and hex 10 is sixteen. A wrong
+        // constant is a wrong instruction; a refusal is only a zero word.
+        for v in ["f0,#00000006", "f0,#00000007", "f0,#00000010", "f0,#000003E8"] {
+            assert!(encoding_refused("MVFD", v), "{v} must not encode");
+        }
+    }
+
+    #[test]
+    fn a_bare_decimal_is_not_read_as_hex() {
+        // `10` is ten as the source writes it and sixteen once folded, so only
+        // the spellings that say which one they are get a value.
+        assert_eq!(word("MVFD", "f0,#10"), word("MVFD", "f0,#10.0"));
+        assert_eq!(word("MVFD", "f0,#0000000A"), word("MVFD", "f0,#10.0"));
+        assert!(encoding_refused("MVFD", "f0,#00000010"));
+    }
 }
 
 // ---------------------------------------------------------------- encoding
@@ -1271,7 +1326,39 @@ fn operand_or_constant(text: &str) -> Option<u32> {
         "5" | "5.0" => 5,
         "0.5" => 6,
         "10" | "10.0" => 7,
-        _ => return None,
+        // Only the ones with a decimal point ever arrive spelled as the source
+        // wrote them. `#0` is an integer expression, so the evaluator folds it
+        // and hands the encoder `00000000`; matching the source's spelling
+        // alone refused `CMF f0,#0` -- comparing against zero, and the single
+        // commonest FPA instruction in the corpus.
+        _ => constant_index(evaluated_number(t)?)?,
     };
     Some(0b1000 | n)
+}
+
+/// A number as the expression evaluator leaves it.
+///
+/// Arithmetic is folded and re-spelled as eight hex digits, and `&` became
+/// `0x` before that. A bare decimal is not accepted: `10` would be sixteen
+/// under the first rule and ten under the second, and a wrong constant is a
+/// wrong instruction, where refusing it is only a zero word.
+fn evaluated_number(t: &str) -> Option<u32> {
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return u32::from_str_radix(h, 16).ok();
+    }
+    (t.len() == 8 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| u32::from_str_radix(t, 16).ok())
+        .flatten()
+}
+
+/// Which of the eight constants a value is, if it is one of them.
+///
+/// Zero through five sit at their own index and ten sits at seven; a half has
+/// no integer spelling, so it only ever arrives as `0.5` above.
+fn constant_index(v: u32) -> Option<u32> {
+    match v {
+        0..=5 => Some(v),
+        10 => Some(7),
+        _ => None,
+    }
 }
