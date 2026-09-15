@@ -18,12 +18,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from roshell import Shell  # noqa: E402
+import paths  # noqa: E402
 
-HOSTFS = r"F:\RISCOSDEV\rpcemu\win32\RPCEmu\hostfs"
+HOSTFS = paths.HOSTFS
 # Per-process staging. Two runs (or a run and a diagnostic) sharing one
 # directory silently overwrite each other's unit, and the resulting numbers are
 # meaningless -- the assembler is handed a file from the other process.
@@ -34,8 +36,8 @@ STAGE = os.path.join(HOSTFS, STAGE_NAME)
 # HdrSrc/hdr, which serves as the export root here. Staged once.
 HDRROOT = os.path.join(HOSTFS, "xh")
 HDR_NAME = "xh"
-ROSLIST = r"F:\RISCOSDEV\rosasm\target\release\roslist.exe"
-DIFFTEST = r"F:\RISCOSDEV\rosasm\target\release\difftest.exe"
+ROSLIST = paths.ROSLIST
+DIFFTEST = paths.DIFFTEST
 OBJASM = "HostFS::HostFS.$.AcornC/C++.!SetPaths.Lib32.objasm"
 # What RiscOS/Env/ROOL/BCM2835.sh selects for a Pi build, and what
 # BuildSys ASFLAGS passes on to the assembler.
@@ -386,7 +388,7 @@ def main():
 
             if objasm_ok and ours_ok:
                 both_ok += 1
-                tmp = os.path.join(os.environ.get("TEMP", "."), "ours.lst")
+                tmp = os.path.join(tempfile.gettempdir(), "ours.lst")
                 open(tmp, "w", encoding="latin-1").write(r.stdout)
                 d = subprocess.run([DIFFTEST, tmp, lst], capture_output=True, text=True)
                 st = parse_report(d.stdout)

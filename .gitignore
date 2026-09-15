@@ -15,3 +15,8 @@ __pycache__/
 # ObjAsm's objects, collected once from the emulator. Derived from the
 # RISC OS sources and rebuilt by `aofdiff.py --collect`.
 tools/objasm-ref/
+
+# macOS scatters these beside whatever it browses. The tree is worked on
+# from a Mac as well now, and neither is anything to do with the assembler.
+.DS_Store
+._*

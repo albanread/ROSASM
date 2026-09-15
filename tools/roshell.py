@@ -16,8 +16,11 @@ import subprocess
 import sys
 import time
 
-CWD = r"F:\RISCOSDEV\rpcemu\win32\RPCEmu"
-EMU = os.path.join(CWD, "rpcemu-headless.exe")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths  # noqa: E402
+
+CWD = paths.RPCEMU
+EMU = paths.EMU
 # Our own snapshot; boot.snap belongs to the user's session.
 SNAP = os.path.join(CWD, "rosasm-boot.snap")
 
@@ -71,6 +74,10 @@ def claim(cwd):
 
 def orphans(cwd):
     """Stop any emulator running from this directory with no driver left."""
+    if os.name != "nt":
+        # tasklist and taskkill are Windows'. RPCEmu headless is a
+        # Windows build, so there is nothing to orphan anywhere else.
+        return
     try:
         out = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq rpcemu-headless.exe", "/NH"],
@@ -120,7 +127,7 @@ class Shell:
         self.cwd = cwd or CWD
         self.lock = claim(self.cwd)
         self.p = subprocess.Popen(
-            [os.path.join(self.cwd, "rpcemu-headless.exe"), "--rpc"], cwd=self.cwd,
+            [os.path.join(self.cwd, "rpcemu-headless" + paths.EXE), "--rpc"], cwd=self.cwd,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
         )

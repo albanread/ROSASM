@@ -23,9 +23,12 @@ import subprocess
 import sys
 import time
 
-BASE = r"F:\RISCOSDEV\rpcemu\win32\RPCEmu"
-FARM = r"F:\RISCOSDEV\rpcemu\farm"
-HOSTFS = os.path.join(BASE, "hostfs")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths  # noqa: E402
+
+BASE = paths.RPCEMU
+FARM = paths.FARM
+HOSTFS = paths.HOSTFS
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Everything an instance needs, minus hostfs and the large saved states.

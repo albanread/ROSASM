@@ -24,7 +24,26 @@ use rosasm::reloc;
 use rosasm::source::SourceFile;
 
 /// Where to find the encoder. clang drives LLVM's integrated assembler.
-const CLANG: &str = r"C:\Program Files\LLVM\bin\clang.exe";
+///
+/// Two machines means two answers, so this cannot be a constant. `--clang`
+/// names it outright; `ROSASM_CLANG` names it for a whole build, which is
+/// what the sweep and the corpus harness set; failing both, the platform
+/// decides. On Windows that is the installer's path, because clang is not
+/// on PATH there by convention. Everywhere else it is the bare name, so
+/// PATH answers -- and whichever clang answers must be able to assemble
+/// TARGET below, which is the only thing rosasm asks of it.
+fn default_encoder() -> String {
+    match std::env::var("ROSASM_CLANG") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            if cfg!(windows) {
+                r"C:\Program Files\LLVM\bin\clang.exe".to_string()
+            } else {
+                "clang".to_string()
+            }
+        }
+    }
+}
 /// Pi 4: ARMv8-A in AArch32 with NEON.
 const TARGET: &[&str] = &[
     "--target=arm-none-eabi",
@@ -527,6 +546,7 @@ fn main() {
     let mut warn_assertions = false;
     let mut allow_unencodable = false;
     let mut fpa_to_vfp = false;
+    let mut clang: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -558,6 +578,12 @@ fn main() {
             // back and interprets it. For asking what the sources would look
             // like against the floating point the hardware has.
             "--fpa-to-vfp" => fpa_to_vfp = true,
+            // The encoder is not in the same place on two machines, and a
+            // build that guesses wrong should be told, not reconfigured.
+            "--clang" => {
+                i += 1;
+                clang = args.get(i).cloned();
+            }
             "--map" => {
                 i += 1;
                 map = args.get(i).map(PathBuf::from);
@@ -569,10 +595,13 @@ fn main() {
     let (Some(source), Some(out)) = (source, out) else {
         eprintln!(
             "usage: rosasm <source> -o <object> [-I dir]... [-PD assignment]... \
-             [--map file] [--warn-assertions] [--allow-unencodable]              [--fpa-to-vfp] [--keep-temps]"
+             [--map file] [--warn-assertions] [--allow-unencodable] \
+             [--fpa-to-vfp] [--clang path] [--keep-temps]"
         );
         std::process::exit(2);
     };
+    // --clang, then ROSASM_CLANG, then whatever the platform calls it.
+    let clang = clang.unwrap_or_else(default_encoder);
 
     let sf = match SourceFile::load(&source) {
         Ok(s) => s,
@@ -650,14 +679,21 @@ fn main() {
     let mut refused: Vec<Unencodable> = Vec::new();
     let (ual, index, adr_relocs) =
         to_ual(&lines, &ex, &mut refused, allow_unencodable, fpa_to_vfp);
-    let tmp = std::env::temp_dir().join(format!("rosasm-{}", std::process::id()));
+    // A pid is not a unique name: one process may encode more than once, and
+    // the system hands pids out again. The clock's nanoseconds separate them,
+    // so a farm of parallel jobs cannot read each other's lowered assembly.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp =
+        std::env::temp_dir().join(format!("rosasm-{}-{unique:08x}", std::process::id()));
     let asm_path = tmp.with_extension("s");
     let obj_path = tmp.with_extension("o");
     if let Err(e) = std::fs::write(&asm_path, &ual) {
         eprintln!("rosasm: {e}");
         std::process::exit(1);
     }
-    let run = Command::new(CLANG)
+    let run = Command::new(&clang)
         .args(TARGET)
         .arg("-c")
         .arg(&asm_path)
@@ -677,7 +713,8 @@ fn main() {
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("rosasm: cannot run the encoder at {CLANG}: {e}");
+            eprintln!("rosasm: cannot run the encoder at {clang}: {e}");
+            eprintln!("        name one with --clang, or set ROSASM_CLANG");
             std::process::exit(1);
         }
     }

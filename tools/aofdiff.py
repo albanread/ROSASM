@@ -41,6 +41,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,15 +54,16 @@ from component_flags import (  # noqa: E402
 from corpus_diff import chr_literal  # noqa: E402
 from export_hdrs import export_hdrs  # noqa: E402
 from roshell import Shell  # noqa: E402
+import paths  # noqa: E402
 
-HOSTFS = r"F:\RISCOSDEV\rpcemu\win32\RPCEmu\hostfs"
+HOSTFS = paths.HOSTFS
 STAGE_NAME = "xd"
 HDR_NAME = "xh"
 STAGE = os.path.join(HOSTFS, STAGE_NAME)
 HDRSTAGE = os.path.join(HOSTFS, HDR_NAME)
 OBJASM = "HostFS::HostFS.$.oa"
-ROSASM = r"F:\RISCOSDEV\rosasm\target\release\rosasm.exe"
-AOFDUMP = r"F:\RISCOSDEV\rosasm\target\release\aofdump.exe"
+ROSASM = paths.ROSASM
+AOFDUMP = paths.AOFDUMP
 
 
 def rm(path, patience=20.0):
@@ -313,7 +315,7 @@ class Setup:
         self.root = root
         self.options = component_options(root, build)
         self.dirs = component_dirs(root)
-        tmp = os.environ.get("TEMP", ".")
+        tmp = tempfile.gettempdir()
         self.variables, self.hdrdirs = export_hdrs(
             root, os.path.join(tmp, "rosasm-export"), build, quiet=True
         )
@@ -342,7 +344,7 @@ def compare_one(setup, sh, unit, limit, keep, full=False):
     predefines, generated = setup.inputs_for(unit)
     comp = stage_unit(unit, generated)
     theirs, log = objasm(sh, unit, predefines, "", setup.variables, setup.hdrdirs)
-    mine = os.path.join(os.environ.get("TEMP", "."), "rosasm-ours.o")
+    mine = os.path.join(tempfile.gettempdir(), "rosasm-ours.o")
     if os.path.isfile(mine):
         os.unlink(mine)
     r = ours(unit, comp, setup.hdrdirs, predefines, generated, mine)
@@ -601,7 +603,7 @@ def against(root, build, ref_dir, limit, count, out, only=None):
         us = us[:count]
     tally = {}
     report = open(out, "w", encoding="utf-8") if out else None
-    mine = os.path.join(os.environ.get("TEMP", "."), "rosasm-ours.o")
+    mine = os.path.join(tempfile.gettempdir(), "rosasm-ours.o")
     for n, unit in enumerate(us, 1):
         label = os.path.relpath(unit, os.path.join(root, "Sources"))
         obj_path, _ = reference_paths(ref_dir, root, unit)

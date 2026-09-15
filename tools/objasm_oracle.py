@@ -15,8 +15,11 @@ import subprocess
 import sys
 import time
 
-CWD = r"F:\RISCOSDEV\rpcemu\win32\RPCEmu"
-EMU = os.path.join(CWD, "rpcemu-headless.exe")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths  # noqa: E402
+
+CWD = paths.RPCEMU
+EMU = paths.EMU
 # Our own snapshot: boot.snap belongs to the user's session and may
 # have been taken against a different ROM.
 SNAP = os.path.join(CWD, "rosasm-boot.snap")

@@ -42,12 +42,15 @@ import struct
 import sys
 import zipfile
 
-DEST = r"F:\RISCOSDEV\rpcemu\win32\RPCEmu\hostfs"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths  # noqa: E402
+
+DEST = paths.HOSTFS
 ARCHIVES = [
     # The boot disc. Its contents go at the root, so the wrapper is stripped.
-    (r"F:\RISCOSDEV\roms\HardDisc4.5.30.zip", "HardDisc4"),
+    (os.path.join(paths.ROMS, "HardDisc4.5.30.zip"), "HardDisc4"),
     # The DDE, which brings AcornC/C++ and with it ObjAsm.
-    (r"F:\RISCOSDEV\ROOL_DDE30-9TFC.zip", None),
+    (os.path.join(paths.DEVROOT, "ROOL_DDE30-9TFC.zip"), None),
 ]
 
 ACORN_EXTRA_ID = 0x4341  # 'AC'

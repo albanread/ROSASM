@@ -22,6 +22,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths  # noqa: E402
 import corpus_diff  # noqa: E402
 from corpus_diff import units  # noqa: E402
 from component_flags import (  # noqa: E402
@@ -32,10 +33,12 @@ from component_flags import (  # noqa: E402
 )
 from export_hdrs import components, export_hdrs  # noqa: E402
 
-# Overridable so a sweep can run against a build other than the one in
-# `target/release`, which the emulator harness may be executing.
-ROSASM = os.environ.get("ROSASM", r"F:\RISCOSDEV\rosasm\target\release\rosasm.exe")
-AOFDUMP = ROSASM.replace("rosasm.exe", "aofdump.exe")
+# Overridable, by $ROSASM and $AOFDUMP, so a sweep can run against a build
+# other than the one in `target/release` the emulator harness may be
+# executing. Each is resolved on its own: deriving one from the other by
+# substituting `rosasm.exe` for `aofdump.exe` only worked on Windows.
+ROSASM = paths.ROSASM
+AOFDUMP = paths.AOFDUMP
 # Filled from the build's own environment file once the export tree is built.
 PD = []
 

@@ -50,9 +50,11 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BUILDHOST = r"F:\RISCOSDEV\riscos-src\BuildHost"
+sys.path.insert(0, HERE)
+import paths  # noqa: E402
+BUILDHOST = paths.BUILDHOST
 BINDIR = os.path.join(HERE, "hostbin")
-CLANG = r"C:\Program Files\LLVM\bin\clang.exe"
+CLANG = paths.CLANG
 
 # Flags that let source written for Norcroft through a modern compiler without
 # touching it. See the module docstring for what each one forgives.
@@ -130,7 +132,7 @@ def build(name, force=False):
     """
     if name not in TOOLS:
         raise SystemExit(f"{name}: not a tool this knows about")
-    exe = os.path.join(BINDIR, name + (".exe" if os.name == "nt" else ""))
+    exe = os.path.join(BINDIR, name + paths.EXE)
     if os.path.isfile(exe) and not force:
         return exe
     if not is_cloned(name) and not clone(name):
@@ -167,7 +169,7 @@ def main():
     if a.list:
         print("RISC OS build utilities, from the BuildHost tree:\n")
         for name, (path, what) in sorted(TOOLS.items()):
-            if os.path.isfile(os.path.join(BINDIR, name + ".exe")):
+            if os.path.isfile(os.path.join(BINDIR, name + paths.EXE)):
                 state = "built"
             elif is_cloned(name):
                 state = "source here"
