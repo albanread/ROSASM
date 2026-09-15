@@ -112,6 +112,13 @@ def is_cloned(name):
 def clone(name):
     """Fetch the submodule, which the parent checkout registers but omits."""
     path = TOOLS[name][0]
+    # No BuildHost checkout at all, rather than one missing this submodule.
+    # Worth its own answer, because `git` with a `cwd` that does not exist
+    # raises out of `build`'s error handling instead of returning non-zero,
+    # and a caller assembling a corpus loses the whole run over one unit.
+    if not os.path.isdir(BUILDHOST):
+        print(f"[{BUILDHOST}: no BuildHost checkout]", file=sys.stderr)
+        return False
     print(f"[fetching {path}]", file=sys.stderr)
     r = subprocess.run(
         ["git", "submodule", "update", "--init", path],

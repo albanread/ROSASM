@@ -7,20 +7,30 @@ that yet, see §1). Numbers below are from that run, not from the committed
 reports.
 
 What rosasm is: the ObjAsm language, layout and object format in Rust, with
-clang used to encode single instructions. It works: 212 of the 241 units in
+clang used to encode single instructions. It works: 215 of the 245 units in
 the BCM2835 build reach an AOF object. What it is not yet: an assembler a ROM
 can be built with, and the gap is enumerable. This list is that enumeration,
 in the order that makes the corpus numbers trustworthy first.
 
-| Measured on the head build | |
-|---|---:|
-| units in the BCM2835 build | 241 |
-| assembling to an object | 212 (88.0%) |
-| code bytes emitted | 240,596 in 254 areas |
-| instructions emitted as zero words | 220, all FPA extended precision and transcendentals |
-| failures | 29: 13 outside the build, 10 encoder rejections, 3 assertions, 3 missing generated sources |
-| byte-identical to ObjAsm | 4, in an oracle run that compared 18 units before its ObjAsm side died |
-| sweep time, 8 jobs | 2 minutes |
+| Measured on the head build | 2026-09-10 | 2026-09-15 |
+|---|---:|---:|
+| units in the BCM2835 build | 241 | 245 |
+| assembling to an object | 212 (88.0%) | 215 (87.8%) |
+| code bytes emitted | 240,596 in 254 areas | 224,284 in 262 areas |
+| instructions emitted as zero words | 220 | **110** |
+| failures | 29 | 30, of which 15 outside the build |
+| byte-identical to ObjAsm | 4, in an oracle run that compared 18 units before its ObjAsm side died | not re-run |
+
+The zero words halved because §0 and §1 landed: what used to be emitted
+silently is now counted and refused. All 110 remaining are FPA -- extended
+precision and transcendentals -- which is why the tally is dominated by `CMF`
+and the `LDF` family.
+
+The 2026-09-15 column was measured on the Mac, where there is no `BuildHost`
+checkout, so `tokenise` cannot be built. Seven of the thirty failures are that
+and nothing else (`cannot find TokHelpSrc.s`, `cannot find s.TokHelpSrc`);
+they are a missing tool on one machine, not a defect in the assembler, and
+they do not appear on the Windows side.
 
 ## 0. An object with wrong words in it must not exit 0
 
@@ -128,8 +138,8 @@ and boot" as the second-order check. Do it for one small module first.
 | Check | Result |
 |---|---|
 | `cargo build --release` | clean, zero warnings |
-| `cargo test` | 292 unit tests and 27 integration tests pass |
-| `tools/codegen_sweep.py` on the head build | 241 units, 212 objects, 220 zero words, 29 failures |
+| `cargo test` | 292 unit tests and 27 integration tests pass (325 in all on 2026-09-15) |
+| `tools/codegen_sweep.py` on the head build | 241 units, 212 objects, 220 zero words, 29 failures (2026-09-15: 245, 215, 110, 30) |
 | `--cpu`, target, encoder | clang 22 as `--target=arm-none-eabi -mcpu=cortex-a72 -mfpu=neon-fp-armv8` |
 | the nine ADRL zero words from the committed report | gone since `cbec42f` |
 

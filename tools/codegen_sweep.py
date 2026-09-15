@@ -54,10 +54,29 @@ def classify(err):
         (r"assertion failed", "assertion failed"),
         (r"unknown AREA attribute", "unknown AREA attribute"),
         (r"undefined symbol ([^\s,]+)", "undefined symbol"),
+        # Why an object was not written, as opposed to the per-instruction
+        # warnings above it. The pool one is separate because it is not the
+        # encoder's limitation but the source's layout: an LTORG moves it.
+        (r"the literal pool is \d+ bytes away", "literal pool out of an LDR's reach"),
+        (
+            r"its operands are not ones I know how to encode",
+            "operands the encoder does not know",
+        ),
+        (r"could not be encoded", "instruction not encodable"),
     ]:
         if re.search(pat, err):
             return label
-    first = next((l for l in err.splitlines() if l.strip()), "")
+    # Whatever it was, it was not a warning or a note. Those precede the real
+    # message and are not why anything failed, so taking the first line as the
+    # cause reported an FPA unit as "workspace is 00000B00 bytes".
+    first = next(
+        (
+            l
+            for l in err.splitlines()
+            if l.strip() and not re.search(r"\b(warning|info|note):", l)
+        ),
+        "",
+    )
     return first.strip()[:80] or "failed with no message"
 
 

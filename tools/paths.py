@@ -4,9 +4,9 @@ rosasm is written on two machines, so none of these is a constant. What is
 built in this tree is found from this file's own location, because that is
 where it will always be, whatever the tree is called or which drive it sits
 on. What lives outside the tree -- the RISC OS sources, the emulator, the
-ROMs -- differs per machine and is named by an environment variable, with the
-Windows location it was written on as the default, so nothing moved for that
-machine.
+ROMs -- sits beside the tree in a development root, so that too is found
+from this file rather than written down. Every one of them can be named by
+an environment variable where a machine puts it somewhere else.
 
 The encoder reads the same `ROSASM_CLANG` the assembler itself reads, so one
 variable configures a whole build rather than each tool separately.
@@ -51,8 +51,14 @@ CLANG = _env(
     r"C:\Program Files\LLVM\bin\clang.exe" if os.name == "nt" else "clang",
 )
 
-# Outside the tree, and different on every machine.
-DEVROOT = _env("RISCOSDEV", r"F:\RISCOSDEV")
+# Outside the tree, and different on every machine. The tree is checked out
+# inside the development root on both -- `F:\RISCOSDEV\ROSASM` on one,
+# `/Volumes/S/RISCOSDEV/ROSASM` on the other -- so the root is one directory
+# up, and asking the filesystem beats writing either path down. A drive
+# letter as the default was not merely wrong on a Mac, it was unreachable:
+# every path built from it began `F:\RISCOSDEV/`, which no amount of
+# extracting sources into the right place could satisfy.
+DEVROOT = _env("RISCOSDEV", os.path.dirname(ROOT))
 ROMS = _env("RISCOS_ROMS", os.path.join(DEVROOT, "roms"))
 RISCOS_SRC = _env("RISCOS_SRC", os.path.join(DEVROOT, "riscos-src"))
 BUILDHOST = _env("BUILDHOST", os.path.join(RISCOS_SRC, "BuildHost"))
