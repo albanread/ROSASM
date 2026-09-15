@@ -1,3 +1,9 @@
+> [!CAUTION]
+> 🛑 **REPOSITORY CLOSED — UNMAINTAINED.**
+>
+> Do not assume the reliability of any data in this repository. It will be
+> archived on **15 October 2026**.
+
 # rosasm
 
 An ObjAsm-compatible assembler for the RISC OS 5 sources, written in Rust.
