@@ -977,6 +977,33 @@ mod tests {
     }
 
     #[test]
+    fn a_label_load_reaches_through_pc() {
+        // `LDFE f1, SqrtHalf` in mathasm: the expander folds a label in this
+        // area to a distance from the instruction, and `pc` reads eight bytes
+        // past it, so that much comes off the distance.
+        assert_eq!(word("LDFD", "f0, .+36"), word("LDFD", "f0, [pc, #28]"));
+        assert_eq!(word("LDFD", "f0, .-8"), word("LDFD", "f0, [pc, #-16]"));
+        assert_eq!(word("LDFS", "f2, .+8"), word("LDFS", "f2, [pc, #0]"));
+        // A load of what follows the instruction is the one that reads as
+        // zero, and it is a real offset rather than a missing one.
+        assert_eq!(word("LDFE", "f1, .+8"), 0xEDDF1100);
+    }
+
+    #[test]
+    fn a_label_beyond_the_fpas_reach_is_refused() {
+        // Eight bits counting words: 1020 bytes either way, a quarter of what
+        // an ordinary LDR reaches. Wrapping it would load the wrong address.
+        assert!(encoding_refused("LDFD", "f0, .+1036"));
+        assert!(encoding_refused("LDFD", "f0, .-1020"));
+        // The edge itself still encodes, either way.
+        assert!(!encoding_refused("LDFD", "f0, .+1028"));
+        assert!(!encoding_refused("LDFD", "f0, .-1012"));
+        // And an address the offset cannot name exactly is refused, not
+        // rounded to one it can.
+        assert!(encoding_refused("LDFD", "f0, .+10"));
+    }
+
+    #[test]
     fn a_bare_decimal_is_not_read_as_hex() {
         // `10` is ten as the source writes it and sixteen once folded, so only
         // the spellings that say which one they are get a value.
@@ -1223,6 +1250,32 @@ fn data_transfer(f: &Fpa, cond: u32, parts: &[String]) -> Option<u32> {
 /// Gives back the base register, the offset in words, and the P, U and W bits.
 fn addressing(text: &str) -> Option<(u32, u32, u32, u32, u32)> {
     let t = text.trim();
+
+    // `LDFE f1, SqrtHalf` -- a label in this same area, which the expander has
+    // already folded to a distance from the instruction. The FPA loads it the
+    // way any ARM load reaches a literal, through `pc`, which reads eight
+    // bytes ahead of the instruction that names it.
+    if let Some(rest) = t.strip_prefix('.') {
+        let rest = rest.trim();
+        let distance = if rest.is_empty() {
+            0
+        } else {
+            parse_offset(rest.strip_prefix('+').unwrap_or(rest))?
+        };
+        let from_pc = distance - 8;
+        if from_pc % 4 != 0 {
+            return None;
+        }
+        let words = from_pc / 4;
+        let magnitude = words.unsigned_abs() as u32;
+        // Eight bits of words: 1020 bytes either way, a quarter of what an
+        // ordinary `LDR` reaches.
+        if magnitude > 0xFF {
+            return None;
+        }
+        return Some((15, magnitude, 1, u32::from(words >= 0), 0));
+    }
+
     let close = t.find(']')?;
     let inside = t.get(1..close)?;
     let after = t.get(close + 1..)?.trim();
