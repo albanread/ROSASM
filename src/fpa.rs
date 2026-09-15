@@ -977,6 +977,30 @@ mod tests {
     }
 
     #[test]
+    fn a_float_literal_becomes_the_bits_a_pool_can_hold() {
+        // The three the corpus actually writes.
+        assert_eq!(literal_bits(Precision::Single, "-0.0").unwrap(), "0x80000000");
+        assert_eq!(literal_bits(Precision::Single, "5729.57795").unwrap(), "0x45B30CA0");
+        assert_eq!(literal_bits(Precision::Single, "-1000").unwrap(), "0xC47A0000");
+        // Negative zero is the whole reason one of them is there: it is not
+        // the same word as zero, and an integer reading of the text loses it.
+        assert_ne!(
+            literal_bits(Precision::Single, "-0.0"),
+            literal_bits(Precision::Single, "0.0")
+        );
+    }
+
+    #[test]
+    fn a_literal_wider_than_a_pool_word_is_refused() {
+        // A pool reserves one word. A double needs two and an extended three,
+        // so these are refused rather than truncated to a different value.
+        assert!(literal_bits(Precision::Double, "1.5").is_none());
+        assert!(literal_bits(Precision::Extended, "1.5").is_none());
+        // And something that is not a number at all is not a literal.
+        assert!(literal_bits(Precision::Single, "SomeSymbol").is_none());
+    }
+
+    #[test]
     fn a_label_load_reaches_through_pc() {
         // `LDFE f1, SqrtHalf` in mathasm: the expander folds a label in this
         // area to a distance from the instruction, and `pc` reads eight bytes
@@ -1144,6 +1168,25 @@ fn transfer_opcode(stem: &str, exception: bool) -> Option<u32> {
         "CNF" => 0b1011,
         _ => return None,
     })
+}
+
+/// The value an FPA literal pool must hold, written as an integer.
+///
+/// `LDFS f1, =5729.57795` loads from a pool exactly as `LDR r0, =n` does, but
+/// a pool holds words and the source wrote a decimal fraction. Turning it
+/// into the bits that represent it here, rather than teaching the pool about
+/// floating point, means the pool's sharing of identical literals, its
+/// two-pass layout and its relocations all go on working unchanged.
+///
+/// Single precision only. A double needs two words and an extended three,
+/// where the pool reserves one, so those are refused rather than truncated to
+/// a value that is not the one the source asked for.
+pub fn literal_bits(precision: Precision, text: &str) -> Option<String> {
+    if precision != Precision::Single {
+        return None;
+    }
+    let v: f32 = text.trim().parse().ok()?;
+    Some(format!("0x{:08X}", v.to_bits()))
 }
 
 /// An FPA instruction as the word FPEmulator will read.

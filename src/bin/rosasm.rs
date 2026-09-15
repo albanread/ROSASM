@@ -194,7 +194,12 @@ fn to_ual(
         // a pool, and the pool is in this same area, so the distance to it is
         // fixed however the area is placed.
         if let Some(target) = l.literal {
-            match pool_load(op, &operands, l.addr, target) {
+            let loaded = if rosasm::fpa::is_fpa(op) {
+                fpa_pool_load(op, &operands, l.addr, target)
+            } else {
+                pool_load(op, &operands, l.addr, target)
+            };
+            match loaded {
                 Ok(text) => {
                     s.push_str(&format!("        {text}\n"));
                     index.push(i);
@@ -372,6 +377,41 @@ fn pool_load(mnemonic: &str, operands: &str, here: u32, target: u32) -> Result<S
     } else {
         format!("{m} {rd}, .+{delta}")
     })
+}
+
+/// An FPA load from the literal pool, as the word FPEmulator will read.
+///
+/// The same pool and the same distance as `pool_load`, but nothing in the
+/// answer goes through the encoder: there is no coprocessor 1 here for LLVM
+/// to know about, so the word is built and emitted directly.
+///
+/// The offset counts words in eight bits, so an FPA load reaches 1020 bytes
+/// where an `LDR` reaches four thousand -- a pool that is fine for the rest
+/// of a file can be out of reach from here, and the error has to say which
+/// limit it ran into.
+fn fpa_pool_load(mnemonic: &str, operands: &str, here: u32, target: u32) -> Result<String, String> {
+    let rd = operands
+        .split_once('=')
+        .map(|(head, _)| head.trim().trim_end_matches(',').trim())
+        .unwrap_or("f0");
+    let delta = target as i64 - here as i64;
+    // `pc` reads eight bytes ahead, which the offset below is measured from.
+    if !(-1012..=1028).contains(&delta) {
+        return Err(format!(
+            "the literal pool is {delta} bytes away; an FPA load reaches 1020 \
+             bytes, so this needs an LTORG nearer the instruction"
+        ));
+    }
+    let addr = if delta < 0 {
+        format!(".-{}", -delta)
+    } else {
+        format!(".+{delta}")
+    };
+    match rosasm::fpa::encode(mnemonic, &format!("{rd}, {addr}")) {
+        Some(Legalized::RawWord(w)) => Ok(format!(".inst 0x{w:08X}")),
+        Some(Legalized::Unsupported(why)) => Err(why),
+        _ => Err(format!("{mnemonic} is not an FPA load")),
+    }
 }
 
 /// What an `ADR`/`ADRL` is aiming at, when we can supply it.

@@ -2781,9 +2781,6 @@ impl<'a> Expander<'a> {
     /// signed and doubleword forms, in either suffix order.
     fn literal_operand(line: &Line) -> Option<String> {
         let op = line.opcode_str()?.to_ascii_uppercase();
-        if !op.starts_with("LDR") {
-            return None;
-        }
         let operands = line.operands_str()?;
         let (_, rest) = operands.split_once('=')?;
         // `=` only introduces a literal in the last operand position; an
@@ -2791,7 +2788,29 @@ impl<'a> Expander<'a> {
         if operands.split_once('=')?.0.contains('[') {
             return None;
         }
-        Some(rest.trim().to_string())
+        let rest = rest.trim();
+        if op.starts_with("LDR") {
+            return Some(rest.to_string());
+        }
+        // `LDFS f1, =5729.57795` asks for the same thing of the same pool, so
+        // it takes the same path -- but as the bits the value is made of,
+        // because a pool holds words and this one was written as a fraction.
+        let f = crate::fpa::parse(&op)?;
+        (f.stem == "LDF")
+            .then(|| crate::fpa::literal_bits(f.precision?, rest))
+            .flatten()
+    }
+
+    /// Does this literal always take a pool word?
+    ///
+    /// An `LDR` prefers a `MOV` where the value fits one, which is the
+    /// manual's order. An FPA load has no such form -- its own immediates are
+    /// eight fixed constants written `#1`, not `=1` -- so it goes to the pool
+    /// whatever the bits happen to look like as an ARM immediate.
+    fn always_pooled(line: &Line) -> bool {
+        line.opcode_str()
+            .map(|o| o.to_ascii_uppercase())
+            .is_some_and(|o| !o.starts_with("LDR"))
     }
 
     /// Decide what an `LDR Rd,=expression` does, and reserve a pool word if it
@@ -2807,6 +2826,7 @@ impl<'a> Expander<'a> {
     /// relocation.
     fn note_literal(&mut self, line: &Line) -> Option<u32> {
         let expr = self.expand_text(&Self::literal_operand(line)?);
+        let always_pooled = Self::always_pooled(line);
         let site = self.literal_sites.len();
         let area = self.current_area_index();
 
@@ -2826,10 +2846,12 @@ impl<'a> Expander<'a> {
                 Ok(Value::Arith(n)) => Some(n),
                 _ => None,
             };
-            let loadable = now.is_some_and(|v| {
-                crate::legalize::as_arm_immediate(v).is_some()
-                    || crate::legalize::as_arm_immediate(!v).is_some()
-            }) && !identifiers(&expr)
+            let loadable = !always_pooled
+                && now.is_some_and(|v| {
+                    crate::legalize::as_arm_immediate(v).is_some()
+                        || crate::legalize::as_arm_immediate(!v).is_some()
+                })
+                && !identifiers(&expr)
                 .iter()
                 .any(|n| self.label_defs.contains_key(n) || self.imports.contains(n));
             return match prev? {
@@ -2853,10 +2875,11 @@ impl<'a> Expander<'a> {
         let relocatable = identifiers(&expr)
             .iter()
             .any(|n| self.label_defs.contains_key(n) || self.imports.contains(n));
-        let fits = value.is_some_and(|v| {
-            crate::legalize::as_arm_immediate(v).is_some()
-                || crate::legalize::as_arm_immediate(!v).is_some()
-        });
+        let fits = !always_pooled
+            && value.is_some_and(|v| {
+                crate::legalize::as_arm_immediate(v).is_some()
+                    || crate::legalize::as_arm_immediate(!v).is_some()
+            });
         if fits && !relocatable {
             self.literal_sites.push(None);
             return None;
