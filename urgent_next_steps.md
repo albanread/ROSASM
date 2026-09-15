@@ -15,26 +15,26 @@ in the order that makes the corpus numbers trustworthy first.
 | Measured on the head build | 2026-09-10 | 2026-09-15 |
 |---|---:|---:|
 | units in the BCM2835 build | 241 | 245 |
-| assembling to an object | 212 (88.0%) | 215 (87.8%) |
-| code bytes emitted | 240,596 in 254 areas | 224,284 in 262 areas |
-| instructions emitted as zero words | 220 | **47** |
-| failures | 29 | 30, of which 15 outside the build |
+| assembling to an object | 212 (88.0%) | 219 (89.4%) |
+| code bytes emitted | 240,596 in 254 areas | 243,092 in 273 areas |
+| instructions emitted as zero words | 220 | **0** |
+| failures | 29 | 26, of which 11 outside the build |
 | byte-identical to ObjAsm | 4, in an oracle run that compared 18 units before its ObjAsm side died | not re-run |
 
-The zero words fell because §0 and §1 landed -- what used to be emitted
-silently is now counted and refused -- and then because the FPA constants
-were being matched against the source's spelling rather than the evaluator's
-(`1b81593`), which alone took 110 to 47.
+There are no zero words left. They fell in three steps, all of them gaps in
+rosasm's own FPA encoder rather than anything the target cannot do -- an FPA
+instruction is never executed here, it traps and FPEmulator reads the word
+back out of the instruction stream as data, so rosasm emits the word directly
+and LLVM, which does not know coprocessor 1 at all, is not asked:
 
-All 47 that remain are `LDF` whose address is a label or a float literal
-rather than `[Rn, #off]`. Nothing about them is a limit of the target: the
-FPA has no instruction its own encoding cannot hold, and rosasm emits these
-as raw words rather than asking LLVM, which does not know the coprocessor at
-all. It is one missing addressing mode, in two forms -- a bare label
-(`LDFE F1,SqrtHalf` in `mathasm`), which is a PC-relative offset within the
-FPA's own +/-1020 byte reach, and a float literal (`LDFNES f0,=-0.0` in
-`cl_body`, `LDFS f1,=5729.57795` in `MakePSFont`), which additionally needs
-the value's bits placed in a pool.
+| | |
+|---|---:|
+| the constants, matched against the source's spelling rather than the evaluator's (`1b81593`) | 110 -> 47 |
+| loads naming a label, which had no addressing mode (`e3f9164`) | 47 -> 5 |
+| loads of a float literal, which never reached the pool (`d7e9f6a`) | 5 -> 0 |
+
+The last of those also took four RISC_OSLib units from failing to assembling,
+which is why the failure count moved.
 
 The 2026-09-15 column was measured on the Mac, where there is no `BuildHost`
 checkout, so `tokenise` cannot be built. Seven of the thirty failures are that
@@ -87,13 +87,11 @@ Traced with the join above; each is a small, specific fix.
 - **`TEQNEP` reaches the encoder** (`DA_HostFS:214`). `is_psr_form` looks
   for `P` immediately after the stem; a condition in between hides it. Match
   `<cmp><cond>P` too, so it is refused as the 26-bit form it is.
-- **FPA float literals** (`cl_body.s:1330`, reached from six RISC_OSLib
-  units: `cl_obj_r`, `cl_obj_m`, `cl_mod_r`, `k_obj_r`, `k_obj_m`,
-  `k_mod_r`). `LDFNES f0, =-0.0` becomes `VLDRNE s0, =-0.0`, which clang
-  rejects. A float literal needs the bit pattern of the value in the literal
-  pool and a `VLDR` from there, in the pool machinery the expander already
-  has for integers. These six are the C runtime's assembler side, so the C
-  track needs them.
+- ~~**FPA float literals**~~ done in `d7e9f6a`. The premise was wrong in an
+  instructive way: it read as a translation problem -- `LDFNES f0, =-0.0`
+  becoming a `VLDRNE` clang rejects -- when nothing should be asking clang.
+  The FPA word is emitted directly, and what was missing was only that the
+  pool was reached from `LDR` alone.
 - **Cross-area `LDR`/`STR` of a label plus a field** (`NetFiler:1467, 1468,
   1537, 1540, 1542, 1545`). `STR r14, mm_display + mi_submenu` names a label
   in another area; `fold_address` leaves it, and clang cannot relocate it.
@@ -148,8 +146,8 @@ and boot" as the second-order check. Do it for one small module first.
 | Check | Result |
 |---|---|
 | `cargo build --release` | clean, zero warnings |
-| `cargo test` | 292 unit tests and 27 integration tests pass (329 in all on 2026-09-15) |
-| `tools/codegen_sweep.py` on the head build | 241 units, 212 objects, 220 zero words, 29 failures (2026-09-15: 245, 215, 47, 30) |
+| `cargo test` | 292 unit tests and 27 integration tests pass (333 in all on 2026-09-15) |
+| `tools/codegen_sweep.py` on the head build | 241 units, 212 objects, 220 zero words, 29 failures (2026-09-15: 245, 219, 0, 26) |
 | `--cpu`, target, encoder | clang 22 as `--target=arm-none-eabi -mcpu=cortex-a72 -mfpu=neon-fp-armv8` |
 | the nine ADRL zero words from the committed report | gone since `cbec42f` |
 
