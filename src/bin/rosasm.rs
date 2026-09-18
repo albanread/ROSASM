@@ -1,15 +1,22 @@
-//! `rosasm` — assemble ObjAsm source to an AOF object.
+//! `rosasm` — assemble ObjAsm source to an AOF object, or to an ELF one.
 //!
 //!     rosasm <source> -o <object> [-I dir]... [-PD "Sym SETA 1"]...
-//!                      [--map <file>] [--keep-temps]
+//!                      [--map <file>] [--elf] [--keep-temps]
 //!
 //! The pipeline: expand the macro language, lower each instruction to UAL,
-//! hand that to LLVM's integrated assembler for encoding, then translate the
-//! ELF it produces into AOF, which is what the RISC OS linker reads.
+//! hand that to LLVM's integrated assembler for encoding, then write the
+//! result out — as AOF, which is what the RISC OS linker reads, or with
+//! `--elf` as ELF, which is what roscc reads.
 //!
 //! LLVM is used only as an encoder. Everything above the mnemonic — the macro
-//! language, conditional assembly, the symbol table, layout — is ours, and
-//! everything below the object file is AOF, which LLVM knows nothing about.
+//! language, conditional assembly, the symbol table, layout — is ours, and so
+//! is everything below the object file.
+//!
+//! The two containers are siblings, not a conversion of one into the other.
+//! Because the encoder is clang, every relocation arrives here in ELF terms
+//! already; AOF's flag word and AOF's addend convention are worked out from
+//! those, and so is ELF's. `--elf` is therefore the shorter path, not a
+//! second translation of a first.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +24,7 @@ use std::process::Command;
 
 use rosasm::aof::{self, area_attr, sym_attr};
 use rosasm::elfread;
+use rosasm::elfwrite;
 use rosasm::expand::{self, Expander, ExpandedLine, FileResolver};
 use rosasm::legalize::{self, AdrTarget, Legalized};
 use rosasm::lex;
@@ -586,6 +594,7 @@ fn main() {
     let mut warn_assertions = false;
     let mut allow_unencodable = false;
     let mut fpa_to_vfp = false;
+    let mut elf_out = false;
     let mut clang: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -618,6 +627,11 @@ fn main() {
             // back and interprets it. For asking what the sources would look
             // like against the floating point the hardware has.
             "--fpa-to-vfp" => fpa_to_vfp = true,
+            // AOF is what the RISC OS linker reads, and the default. roscc
+            // reads ELF and nothing else, so this is the switch that lets a
+            // hand-written ObjAsm header be linked against clang's output --
+            // a module built on the Mac with no DDE anywhere in it.
+            "--elf" => elf_out = true,
             // The encoder is not in the same place on two machines, and a
             // build that guesses wrong should be told, not reconfigured.
             "--clang" => {
@@ -635,7 +649,7 @@ fn main() {
     let (Some(source), Some(out)) = (source, out) else {
         eprintln!(
             "usage: rosasm <source> -o <object> [-I dir]... [-PD assignment]... \
-             [--map file] [--warn-assertions] [--allow-unencodable] \
+             [--map file] [--elf] [--warn-assertions] [--allow-unencodable] \
              [--fpa-to-vfp] [--clang path] [--keep-temps]"
         );
         std::process::exit(2);
@@ -883,6 +897,9 @@ fn main() {
     // import, becomes an external reference for the linker to satisfy.
     let defs = ex.label_defs();
     let mut symbols: Vec<aof::Symbol> = Vec::new();
+    // The same relocations in ELF's terms, collected beside the AOF ones as
+    // each is worked out. Empty unless `--elf` asked for that container.
+    let mut elf_rels: Vec<elfwrite::Rel> = Vec::new();
     // The spec: bit 8 "denotes that the symbol identifies a (usually
     // read-only) datum, rather than an executable instruction", and is
     // meaningful only inside a code area. ObjAsm decides it by what it was
@@ -998,21 +1015,37 @@ fn main() {
         // Three cases: a target in this same area needs no directive at all,
         // one in another of our areas is relocated by that area's base, and
         // anything else is relocated by the symbol's value.
-        let (new_addend, by) = match defs.get(&name) {
-            Some((ai, off)) if *ai == seg.area => (reloc::local_pc_addend(here, *off), None),
+        //
+        // Each case has two spellings. AOF measures its addend from the area
+        // base, which is what `pc_relative_addend` works out. ELF keeps the
+        // addend the encoder already put in the field and adds only the
+        // target's offset within whatever it names -- nothing for a symbol,
+        // since the symbol is the target, and the offset for a section. So
+        // the ELF form is not recovered from the AOF one: both are worked out
+        // here, from the encoder's, and the output format picks.
+        let (new_addend, by, elf_rel) = match defs.get(&name) {
+            Some((ai, off)) if *ai == seg.area => {
+                (reloc::local_pc_addend(here, *off), None, None)
+            }
             Some((ai, off)) => (
                 reloc::pc_relative_addend(addend, here, *off),
                 Some(aof::RelocBy::Area(*ai as u32)),
+                Some((elfwrite::Target::Section(*ai), addend + *off as i32)),
             ),
             None => {
                 let idx = symbol_index(&mut symbols, &name);
                 (
                     reloc::pc_relative_addend(addend, here, 0),
                     Some(aof::RelocBy::Symbol(idx)),
+                    Some((elfwrite::Target::Symbol(idx), addend)),
                 )
             }
         };
-        match encode(insn, new_addend) {
+        let in_place = match (elf_out, &elf_rel) {
+            (true, Some((_, a))) => *a,
+            _ => new_addend,
+        };
+        match encode(insn, in_place) {
             Some(w) => set_word_at(&mut areas[seg.area].data, here, w),
             None => {
                 refused.push(Unencodable {
@@ -1025,6 +1058,16 @@ fn main() {
                 });
                 continue;
             }
+        }
+        if let Some((target, _)) = elf_rel {
+            // The encoder's own relocation type travels unchanged: a branch
+            // is R_ARM_CALL or R_ARM_JUMP24 because clang said so.
+            elf_rels.push(elfwrite::Rel {
+                area: seg.area,
+                offset: here,
+                target,
+                kind: r.kind,
+            });
         }
         if let Some(by) = by {
             areas[seg.area].relocs.push(aof::Reloc {
@@ -1049,6 +1092,28 @@ fn main() {
         let Some(seg) = segments.iter().find(|s| s.line == a.line) else {
             continue;
         };
+        if elf_out {
+            // AOF lets the linker rewrite a run of instructions, which is how
+            // an `ADRL` at an imported symbol is resolved. ELF spells that as
+            // the R_ARM_ALU_PC_G* group, and roscc implements none of it, so
+            // an object written here would link silently wrong. Say so.
+            refused.push(Unencodable {
+                where_: lines.get(a.line).map_or_else(
+                    || format!("&{:X}", seg.dest),
+                    |l| format!("{}:{}", l.origin.file, l.origin.line),
+                ),
+                what: lines
+                    .get(a.line)
+                    .map(|l| l.text.trim().to_string())
+                    .unwrap_or_default(),
+                why: format!(
+                    "ADR at the imported symbol {} has no ELF relocation \
+                     this writes (R_ARM_ALU_PC_G*); load the address instead",
+                    a.name
+                ),
+            });
+            continue;
+        }
         let idx = symbol_index(&mut symbols, &a.name);
         let Some(area) = areas.get_mut(seg.area) else { continue };
         area.relocs.push(aof::Reloc {
@@ -1077,6 +1142,29 @@ fn main() {
                 aof::RelocBy::Symbol(symbol_index(&mut symbols, name))
             }
         };
+        if elf_out {
+            // A whole word holding an address is R_ARM_ABS32, whose addend is
+            // the word itself -- which already holds it. Narrower fields have
+            // R_ARM_ABS8 and ABS16, but roscc applies neither.
+            if field == aof::FieldType::Word {
+                let target = match &by {
+                    aof::RelocBy::Area(a) => elfwrite::Target::Section(*a as usize),
+                    aof::RelocBy::Symbol(i) => elfwrite::Target::Symbol(*i),
+                };
+                elf_rels.push(elfwrite::Rel {
+                    area: f.area,
+                    offset: f.offset,
+                    target,
+                    kind: reloc::elf_type::R_ARM_ABS32,
+                });
+            } else {
+                eprintln!(
+                    "rosasm: a {}-byte relocated field ({}) has no ELF \
+                     relocation this writes",
+                    f.width, f.expr
+                );
+            }
+        }
         let Some(area) = areas.get_mut(f.area) else { continue };
         area.relocs.push(aof::Reloc {
             offset: f.offset,
@@ -1120,7 +1208,14 @@ fn main() {
         entry: None,
         identification: format!("rosasm {}", env!("CARGO_PKG_VERSION")),
     };
-    if let Err(e) = std::fs::write(&out, obj.write()) {
+    // One object, two containers. AOF is what the RISC OS linker reads; ELF
+    // is what roscc reads, and roscc is how a module is built without the DDE.
+    let bytes = if elf_out {
+        elfwrite::write(&obj.areas, &obj.symbols, &elf_rels)
+    } else {
+        obj.write()
+    };
+    if let Err(e) = std::fs::write(&out, bytes) {
         eprintln!("rosasm: {}: {e}", out.display());
         std::process::exit(1);
     }

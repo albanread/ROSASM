@@ -89,6 +89,35 @@ aofdump <object> -x
    Elsewhere                &0                       reference, global
 ```
 
+### ELF, for linkers that do not read AOF
+
+AOF is what the RISC OS linker reads, and the default. `--elf` writes the same
+object as an ELF32 little-endian ARM relocatable instead, which is what
+[roscc](https://github.com/albanread/ROSCC) reads — so a hand-written ObjAsm
+module header can be linked against clang's output, and a RISC OS module built
+on a development machine with no DDE and no emulator anywhere in it:
+
+```bash
+rosasm s/head -o head.o --elf
+clang --target=armv8a-none-eabi -mcpu=cortex-a72 -ffreestanding -nostdlib \
+      -fropi -mno-movt -O2 -x c -c c/hostfs -o hostfs.o
+roscc link --module -o 'HostFS,ffa' head.o hostfs.o
+```
+
+This is not a conversion of the AOF. The encoder is clang, so every relocation
+arrives in ELF terms already: AOF's flag word and addend convention are worked
+out from those, and so are ELF's. Both writers are siblings over one object,
+which is why the same relocation reads `EBFFFFFE` in the ELF (addend −8, the
+ELF convention) and `EBFFFF83` in the AOF (measured from the area base).
+
+Two names mean the same thing and each toolchain insists on its own, so the
+writer translates: ObjAsm's `|!!!Module$$Header|`, which `Link -rmf` requires,
+is ELF's `.module`, which roscc looks for.
+
+What ELF cannot yet carry from here: an `ADR` at an *imported* symbol needs the
+`R_ARM_ALU_PC_G*` group, and a relocated byte or halfword field needs
+`R_ARM_ABS8`/`ABS16`. Both are refused rather than written wrong.
+
 ## Checking it against the real ObjAsm
 
 The corpus is the oracle. `tools/` holds the harness:

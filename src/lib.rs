@@ -12,6 +12,7 @@
 
 pub mod aof;
 pub mod elfread;
+pub mod elfwrite;
 pub mod expand;
 pub mod fpa;
 pub mod expr;
