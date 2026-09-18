@@ -1,3 +1,5 @@
+This repository is scheduled to be archived on 15 October 2026. Pull requests and issues are not accepted.
+
 # rosasm
 
 An ObjAsm-compatible assembler for RISC OS 5, written in Rust. It reads
@@ -19,4 +21,3 @@ Needs a Rust toolchain and clang, used as the encoder:
 
 Licence: MIT — see LICENSE.
 
-This repository is scheduled to be archived. Pull requests and issues are not accepted.
