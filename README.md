@@ -18,3 +18,5 @@ Needs a Rust toolchain and clang, used as the encoder:
     target/release/rosasm s/head -o head.o --elf
 
 Licence: MIT — see LICENSE.
+
+This repository is scheduled to be archived. Pull requests and issues are not accepted.
