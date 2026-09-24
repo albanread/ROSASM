@@ -285,11 +285,13 @@ pub fn is_fpa(mnemonic: &str) -> bool {
 /// compare becomes two instructions. Anything refused still occupies its one
 /// word, so a routine full of extended-precision arithmetic keeps every label
 /// around it at the right address.
-pub fn words(mnemonic: &str) -> Option<u32> {
+pub fn words(mnemonic: &str, to_vfp: bool) -> Option<u32> {
     let f = parse(mnemonic)?;
     Some(match f.stem {
-        // VCMP leaves its result in the FPSCR; VMRS brings it to the ARM flags.
-        "CMF" | "CNF" => 2,
+        // Converted, VCMP leaves its result in the FPSCR and VMRS brings it
+        // to the ARM flags: two instructions.  As FPA, a compare is one
+        // word like any other -- counting two moved every label after it.
+        "CMF" | "CNF" if to_vfp => 2,
         _ => 1,
     })
 }
@@ -828,8 +830,9 @@ mod tests {
         assert_eq!(v[0], ("VCMP.F64".into(), "d0, d1".into()));
         assert_eq!(v[1], ("VMRS".into(), "APSR_nzcv, fpscr".into()));
         // And layout has to know that before the encoder runs.
-        assert_eq!(words("CMF"), Some(2));
-        assert_eq!(words("LDFD"), Some(1));
+        assert_eq!(words("CMF", true), Some(2));
+        assert_eq!(words("CMF", false), Some(1));
+        assert_eq!(words("LDFD", true), Some(1));
     }
 
     #[test]
@@ -905,7 +908,7 @@ mod tests {
     fn everything_refused_still_occupies_its_word() {
         // Otherwise every label after a refused instruction would move.
         for m in ["LDFE", "STFP", "SIND", "LFMFD", "FLTD", "FIXZ"] {
-            assert_eq!(words(m), Some(1), "{m}");
+            assert_eq!(words(m, true), Some(1), "{m}");
         }
     }
 
@@ -914,7 +917,7 @@ mod tests {
         assert_eq!(one("RFS", "r2"), ("VMRS".into(), "r2, fpscr".into()));
         assert_eq!(one("WFS", "r3"), ("VMSR".into(), "fpscr, r3".into()));
         assert_eq!(one("RFSNE", "r0"), ("VMRSNE".into(), "r0, fpscr".into()));
-        assert_eq!(words("RFS"), Some(1));
+        assert_eq!(words("RFS", true), Some(1));
     }
 
     #[test]
@@ -927,7 +930,7 @@ mod tests {
     #[test]
     fn a_non_fpa_mnemonic_converts_to_nothing() {
         assert!(convert("MOV", "r0, #1").is_none());
-        assert!(words("MOV").is_none());
+        assert!(words("MOV", false).is_none());
     }
 
     // ---- encoding the constants -----------------------------------------
@@ -937,6 +940,23 @@ mod tests {
             Some(Legalized::RawWord(w)) => w,
             other => panic!("{m} {o}: expected a word, got {other:?}"),
         }
+    }
+
+    /// A post-indexed transfer's offset is an operand of its own after the
+    /// bracket; it was being dropped, and the writeback with it.
+    #[test]
+    fn post_indexed_transfers_keep_their_offset() {
+        // LFM f4, 4, [sp], #48: P clear, U and W set, 12 words.
+        let w = word("LFM", "f4, 4, [sp], #48");
+        assert_eq!((w >> 24 & 1, w >> 23 & 1, w >> 21 & 1, w & 0xFF), (0, 1, 1, 12));
+        // SFM f4, 4, [sp, #-48]!: P, W set, U clear.
+        let w = word("SFM", "f4, 4, [sp, #-48]!");
+        assert_eq!((w >> 24 & 1, w >> 23 & 1, w >> 21 & 1, w & 0xFF), (1, 0, 1, 12));
+        // LDFD f0, [r1], #8 and STFS f2, [r3], #-4.
+        let w = word("LDFD", "f0, [r1], #8");
+        assert_eq!((w >> 24 & 1, w >> 23 & 1, w >> 21 & 1, w & 0xFF), (0, 1, 1, 2));
+        let w = word("STFS", "f2, [r3], #-4");
+        assert_eq!((w >> 24 & 1, w >> 23 & 1, w >> 21 & 1, w & 0xFF), (0, 0, 1, 1));
     }
 
     fn encoding_refused(m: &str, o: &str) -> bool {
@@ -1243,11 +1263,15 @@ fn data_transfer(f: &Fpa, cond: u32, parts: &[String]) -> Option<u32> {
     let fd = fpa_register(parts.first()?)?;
 
     // `LFM f0, 4, [r0, #n]` says how many registers before the address.
+    // The address is everything after the registers: `[r0], #8` splits
+    // into two operands at its comma, and dropping the second lost the
+    // post-indexed offset -- and the writeback with it.
     let (count, addr) = if multiple {
-        (parts.get(1)?.trim().parse::<u32>().ok()?, parts.get(2)?)
+        (parts.get(1)?.trim().parse::<u32>().ok()?, parts.get(2..)?.join(", "))
     } else {
-        (0, parts.get(1)?)
+        (0, parts.get(1..)?.join(", "))
     };
+    let addr = &addr;
 
     // The two precision bits carry the format for a single transfer and the
     // number of registers for a multiple one, where four is written as zero.

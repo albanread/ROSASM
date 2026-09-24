@@ -397,3 +397,26 @@ fn a_failing_assertion_still_reports_after_settling() {
     let err = e.run("test", lines).expect_err("must fail");
     assert!(err.msg.contains("assertion failed"), "{err}");
 }
+
+// ---------------------------------------------------------------- FPA layout
+
+/// Where a label lands after FPA compares, with and without conversion to
+/// VFP.  As FPA every instruction is one word; converted, a compare is two
+/// (VCMP, then VMRS).  Counting two in both moved every later label, and
+/// with it every ADR, DCD and literal load that named one.
+fn label_after_compares(to_vfp: bool) -> u32 {
+    let src = "        AREA    Code, CODE\n        CMF     f0, #0\n        CNFE    f1, f2\nAfter   MOV     r0, r0\n";
+    let lines: Vec<String> = src.lines().map(|s| s.to_string()).collect();
+    let r = MapResolver(HashMap::new());
+    let mut e = Expander::new(&r);
+    e.set_target_builtins();
+    e.set_fpa_to_vfp(to_vfp);
+    e.run("test", lines).expect("expansion");
+    e.label_defs()["After"].1
+}
+
+#[test]
+fn an_fpa_compare_is_one_word_unless_converted() {
+    assert_eq!(label_after_compares(false), 8);
+    assert_eq!(label_after_compares(true), 16);
+}

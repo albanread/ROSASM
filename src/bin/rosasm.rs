@@ -214,7 +214,7 @@ fn to_ual(
                     continue;
                 }
                 Err(why) => {
-                    s.push_str(&placeholder(op, refused.len(), allow));
+                    s.push_str(&placeholder(op, refused.len(), allow, fpa_to_vfp));
                     refused.push(Unencodable::of(l, why));
                     index.push(i);
                     continue;
@@ -230,7 +230,7 @@ fn to_ual(
             adr_relocs.push(AdrReloc {
                 line: i,
                 name,
-                instructions: rosasm::lower::instruction_words(op) as u8,
+                instructions: rosasm::lower::instruction_words(op, fpa_to_vfp) as u8,
             });
         }
         let ctx = legalize::Context {
@@ -250,7 +250,7 @@ fn to_ual(
             Legalized::Unsupported(why) => {
                 // The space stays occupied either way, so later addresses do
                 // not shift and the rest of the object stays readable.
-                s.push_str(&placeholder(op, refused.len(), allow));
+                s.push_str(&placeholder(op, refused.len(), allow, fpa_to_vfp));
                 refused.push(Unencodable::of(l, why));
             }
         }
@@ -353,8 +353,8 @@ fn origin_of<'a>(
 ///
 /// `UDF #n` traps where a zero word would have run on, and `n` says which
 /// of the listed instructions it stands for.
-fn placeholder(mnemonic: &str, n: usize, allow: bool) -> String {
-    let words = rosasm::lower::instruction_words(mnemonic);
+fn placeholder(mnemonic: &str, n: usize, allow: bool, fpa_to_vfp: bool) -> String {
+    let words = rosasm::lower::instruction_words(mnemonic, fpa_to_vfp);
     if allow {
         format!("        UDF #{n}\n").repeat(words)
     } else {
@@ -687,6 +687,7 @@ fn main() {
 
     let mut ex = Expander::new(&resolver);
     ex.set_target_builtins();
+    ex.set_fpa_to_vfp(fpa_to_vfp);
     ex.set_assert_warnings(warn_assertions);
     for pd in &pds {
         if let Err(e) = ex.predefine(pd) {

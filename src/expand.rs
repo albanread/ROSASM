@@ -360,6 +360,9 @@ pub struct Expander<'a> {
     /// of producing one is to find where the layout went wrong, and stopping
     /// at the first assertion throws away the evidence.
     assert_warnings: bool,
+    /// Whether FPA instructions will be converted to VFP, which changes how
+    /// many words a compare takes.
+    fpa_to_vfp: bool,
     /// Register names declared with `RN`. These are kept apart from the symbol
     /// table because `a1 RN 0` and `Flag EQU 0` are the same value with quite
     /// different meanings in an operand.
@@ -740,6 +743,7 @@ impl<'a> Expander<'a> {
             imports: Vec::new(),
             data_fixups: Vec::new(),
             assert_warnings: false,
+            fpa_to_vfp: false,
             reg_aliases: std::collections::HashMap::new(),
             vfp_aliases: std::collections::HashMap::new(),
             fpa_aliases: std::collections::HashMap::new(),
@@ -1096,6 +1100,11 @@ impl<'a> Expander<'a> {
     /// Names declared `IMPORT` or `EXTERN`.
     pub fn imports(&self) -> &[String] {
         &self.imports
+    }
+
+    /// FPA instructions will be converted to VFP (`--fpa-to-vfp`).
+    pub fn set_fpa_to_vfp(&mut self, on: bool) {
+        self.fpa_to_vfp = on;
     }
 
     /// Carry on past a failed `ASSERT`, reporting it. For listings.
@@ -2547,7 +2556,7 @@ impl<'a> Expander<'a> {
 
         // Worked out before the area is borrowed, because the match below
         // holds it mutably.
-        let fpa_words = crate::fpa::words(&up);
+        let fpa_words = crate::fpa::words(&up, self.fpa_to_vfp);
 
         // `SPACE`'s operand is the only one read here, and reading it borrows
         // the symbol table, so it happens before the area is taken -- and

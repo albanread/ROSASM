@@ -618,12 +618,12 @@ mod compare_tests {
 /// has no equivalent for becomes zero words of *this* many, not one, or the
 /// nine `ADRL`s in BCMSupport's veneers each lose a word and take the rest of
 /// the file four bytes with them.
-pub fn instruction_words(mnemonic: &str) -> usize {
+pub fn instruction_words(mnemonic: &str, fpa_to_vfp: bool) -> usize {
     let up = mnemonic.to_ascii_uppercase();
     if is_adrl(&up) {
         return 2;
     }
-    match crate::fpa::words(&up) {
+    match crate::fpa::words(&up, fpa_to_vfp) {
         Some(n) => n as usize,
         None => 1,
     }
